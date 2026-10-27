@@ -19,6 +19,8 @@ object WppMessageType {
     /** Keepalive, either direction. A request is answered by echoing its payload back as a response. */
     const val PING_REQUEST = 8
     const val PING_RESPONSE = 9
+    /** Head unit -> phone, TCP only: withdraws the endpoint the phone dialled. */
+    const val CONNECTION_REJECTION = 10
     /** Not sent; defined so a capture can be read. */
     const val SETUP_INFO = 11
 }
@@ -35,7 +37,9 @@ enum class WppStage {
     AWAIT_INFO_REQUEST,
     /** Credentials delivered; the phone is associating, doing WPS and getting a DHCP lease. */
     SETTLING,
-    /** The phone's projection session landed. */
+    /** The session landed and the phone's channel stays open for it, answering its pings. */
+    HOLDING,
+    /** The phone's projection session landed, or a held channel was released. */
     DONE,
     /** The exchange ended without a session. */
     FAILED
@@ -61,6 +65,12 @@ sealed class WppEvent {
     object TcpSessionUp : WppEvent()
     /** The settling window elapsed with no session. */
     object SettleTimeout : WppEvent()
+    /** The network the phone was sent has been taken down, so its join can no longer succeed. */
+    object NetworkWithdrawn : WppEvent()
+    /** The phone closed the channel. Only acted on in [WppStage.HOLDING]. */
+    object PeerClosed : WppEvent()
+    /** The projection session this channel was held for has ended. */
+    object SessionEnded : WppEvent()
 }
 
 /**
@@ -84,10 +94,19 @@ sealed class WppAction {
      * [phoneWasSilent] is true when the phone never sent a single message — the signature of a
      * head unit whose Bluetooth stack drops our writes, not of a phone-side problem. It is what
      * the handshake backoff counts.
+     *
+     * [joinRefused] is the opposite shape: the phone answered everything and then said it could
+     * not get onto the network. That backoff cannot see it, because the phone was never silent.
      */
-    data class Fail(val reason: String, val phoneWasSilent: Boolean) : WppAction()
+    data class Fail(
+        val reason: String,
+        val phoneWasSilent: Boolean,
+        val joinRefused: Boolean = false
+    ) : WppAction()
     /** Restart the wake poke. Only ever emitted once the phone has given up on this handoff. */
     object ResumePoke : WppAction()
+    /** A held channel is over; close it. [peerClosed] is true when the phone ended it first. */
+    data class Release(val peerClosed: Boolean) : WppAction()
 }
 
 /**
@@ -106,6 +125,10 @@ sealed class WppAction {
  *   HU <- 6 WifiConnectStatus         did the phone actually get on the network
  * ```
  *
+ * A phone that is already on the network skips 2 and 3, since it needs no credentials: it answers
+ * the start request with 7 and reports the join with 6. That is the ordinary shape over TCP, where
+ * the phone dials us from inside the network, and measured on hardware.
+ *
  * What this replaces sent 1, read one message, sent 3 and stopped listening. Types 6 and 7 arrive
  * *after* type 3, so it never saw them — hence no way to tell "still associating" from "gave up",
  * and a timer where the phone was willing to say.
@@ -113,10 +136,18 @@ sealed class WppAction {
  * Pure so the ordering rules can be tested; they cannot be, on a real Bluetooth socket. Not
  * thread-safe: one session per handshake coroutine.
  *
- * @param versionExchangeEnabled whether to open with [WppMessageType.VERSION_REQUEST]. False sends
- *   exactly what shipped before it existed.
+ * Opens with [WppMessageType.VERSION_REQUEST], as a real head unit does, so the phone learns our
+ * version and where to reach us over TCP. What goes in it is [WppEndpointPolicy]'s decision, not
+ * this session's.
  */
-class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
+class WppHandshakeSession(
+    /**
+     * Keep the channel after the session lands instead of finishing: true on Bluetooth, where
+     * Android Auto re-dials a closed RFCOMM while a profile keeps this unit present. Over TCP
+     * there is nothing to hold.
+     */
+    private val holdsChannel: Boolean = false
+) {
 
     companion object {
         /** How long to wait for the phone's version response before carrying on without it.
@@ -130,10 +161,12 @@ class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
         /** How much longer to wait each time the phone says it is still joining. */
         const val SETTLE_EXTENSION_MS = 15_000L
 
-        /** Our protocol version. A guess — no capture of a real head unit's Type 4 has been
-         *  decoded — which is why the setting that sends it is off by default. */
-        const val WPP_VERSION_MAJOR = 1
-        const val WPP_VERSION_MINOR = 1
+        /** Our protocol version, read out of Gearhead 17.5. The phone ignores the WPP-over-TCP
+         *  endpoint below 4.1, and at exactly 4.1 it also requires our make to be on an allowlist
+         *  we are not on. 4.2 clears both, and announcing a version above the phone's own is
+         *  negotiated down rather than refused. */
+        const val WPP_VERSION_MAJOR = 4
+        const val WPP_VERSION_MINOR = 2
     }
 
     var stage: WppStage = WppStage.NEW
@@ -163,7 +196,7 @@ class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
         WppStage.AWAIT_INFO_REQUEST -> INFO_REQUEST_TIMEOUT_MS
         WppStage.SETTLING -> settleBudgetMs
         // AWAIT_CREDENTIALS is bounded by the caller's own credential wait, which ends in
-        // CredentialsReady or CredentialsUnavailable; NEW, DONE and FAILED never expire.
+        // CredentialsReady or CredentialsUnavailable; NEW, HOLDING, DONE and FAILED never expire.
         else -> null
     }
 
@@ -176,6 +209,16 @@ class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
      */
     fun on(event: WppEvent): List<WppAction> {
         if (isTerminal()) return emptyList()
+        if (stage == WppStage.HOLDING) return onHolding(event)
+
+        // The projection session landing ends the exchange from wherever it has got to: whatever
+        // the phone was still going to ask for, it has stopped needing. Over TCP that can happen
+        // before the exchange has run its course, because the phone dials us from inside the
+        // network it is already on.
+        if (event is WppEvent.TcpSessionUp) {
+            stage = if (holdsChannel) WppStage.HOLDING else WppStage.DONE
+            return listOf(WppAction.CompleteSuccess)
+        }
 
         if (event is WppEvent.MessageReceived) {
             messagesReceived++
@@ -183,6 +226,8 @@ class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
             // everywhere, so it never reaches the per-stage logic below and never changes stage.
             if (event.type == WppMessageType.PING_REQUEST) return listOf(WppAction.SendPingResponse)
             if (event.type == WppMessageType.PING_RESPONSE) return emptyList()
+            // Answering a phone's type 1 makes it send type 2, which is credentials onto a live session.
+            if (event.type == WppMessageType.START_REQUEST) return emptyList()
         }
 
         return when (stage) {
@@ -191,18 +236,26 @@ class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
             WppStage.AWAIT_CREDENTIALS -> onAwaitCredentials(event)
             WppStage.AWAIT_INFO_REQUEST -> onAwaitInfoRequest(event)
             WppStage.SETTLING -> onSettling(event)
-            WppStage.DONE, WppStage.FAILED -> emptyList()
+            WppStage.HOLDING, WppStage.DONE, WppStage.FAILED -> emptyList()
         }
     }
 
+    /** Pings are answered and nothing else is: credentials onto a live session drop it. */
+    private fun onHolding(event: WppEvent): List<WppAction> = when {
+        event is WppEvent.MessageReceived -> {
+            messagesReceived++
+            if (event.type == WppMessageType.PING_REQUEST) listOf(WppAction.SendPingResponse) else emptyList()
+        }
+        event is WppEvent.PeerClosed -> { stage = WppStage.DONE; listOf(WppAction.Release(peerClosed = true)) }
+        event is WppEvent.SessionEnded -> { stage = WppStage.DONE; listOf(WppAction.Release(peerClosed = false)) }
+        else -> emptyList()
+    }
+
     private fun onNew(event: WppEvent): List<WppAction> = when (event) {
-        is WppEvent.SocketReady ->
-            if (versionExchangeEnabled) {
-                stage = WppStage.AWAIT_VERSION
-                listOf(WppAction.SendVersionRequest)
-            } else {
-                enterAwaitCredentials()
-            }
+        is WppEvent.SocketReady -> {
+            stage = WppStage.AWAIT_VERSION
+            listOf(WppAction.SendVersionRequest)
+        }
         is WppEvent.CredentialsReady -> { credentialsLatched = true; emptyList() }
         is WppEvent.CredentialsUnavailable -> fail("no WiFi credentials to hand the phone")
         else -> emptyList()
@@ -244,8 +297,21 @@ class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
         }
         event is WppEvent.MessageReceived && event.type == WppMessageType.START_RESPONSE ->
             if (isFailureStatus(event.status)) {
-                fail("phone rejected the projection endpoint (WifiStartResponse status=${event.status})")
+                fail("phone rejected the projection endpoint (WifiStartResponse status=${WppStatus.describe(event.status)})")
             } else {
+                emptyList()
+            }
+        // A phone already on our network never asks for credentials. Over TCP it dialled us from
+        // inside the network, so it acknowledges the start request and then reports the join, and
+        // waiting for a type 2 that cannot come would fail a handoff that has already worked.
+        event is WppEvent.MessageReceived && event.type == WppMessageType.CONNECT_STATUS ->
+            if (isFailureStatus(event.status)) {
+                fail(
+                    "phone reported join failure (type ${event.type}, status=${WppStatus.describe(event.status)})",
+                    joinRefused = true
+                ) + WppAction.ResumePoke
+            } else {
+                stage = WppStage.SETTLING
                 emptyList()
             }
         event is WppEvent.StageTimeout ->
@@ -255,17 +321,17 @@ class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
     }
 
     private fun onSettling(event: WppEvent): List<WppAction> = when {
-        event is WppEvent.TcpSessionUp -> {
-            stage = WppStage.DONE
-            listOf(WppAction.CompleteSuccess)
-        }
         event is WppEvent.MessageReceived &&
             (event.type == WppMessageType.CONNECT_STATUS || event.type == WppMessageType.START_RESPONSE) ->
             if (isFailureStatus(event.status)) {
                 // The phone has stopped trying, so nothing is left to disturb: this and the
                 // settle timeout are the only places where restarting the poke is safe.
-                fail("phone reported join failure (type ${event.type}, status=${event.status})") +
-                    WppAction.ResumePoke
+                // Only type 6 is the phone failing to reach the network; a rejected type 7 is the
+                // endpoint being refused, which a prompt retry can still fix.
+                fail(
+                    "phone reported join failure (type ${event.type}, status=${WppStatus.describe(event.status)})",
+                    joinRefused = event.type == WppMessageType.CONNECT_STATUS
+                ) + WppAction.ResumePoke
             } else if (event.type == WppMessageType.CONNECT_STATUS) {
                 extendSettle()
             } else {
@@ -276,6 +342,10 @@ class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
         // has not given up, and refusing it would strand a handoff that could still complete.
         event is WppEvent.MessageReceived && event.type == WppMessageType.INFO_REQUEST ->
             listOf(WppAction.SendInfoResponse)
+        // Some platforms drop an emptied group the moment the phone's first try leaves it, and
+        // the phone then hunts the old name until it gives up. Ending now hands it the new one.
+        event is WppEvent.NetworkWithdrawn ->
+            fail("the network the phone was sent was taken down while it was joining") + WppAction.ResumePoke
         // Today's behaviour: leave the listeners open and let the wake poke retry.
         event is WppEvent.SettleTimeout -> {
             stage = WppStage.FAILED
@@ -314,9 +384,11 @@ class WppHandshakeSession(private val versionExchangeEnabled: Boolean) {
         return listOf(WppAction.ExtendSettle)
     }
 
-    private fun fail(reason: String): List<WppAction> {
+    private fun fail(reason: String, joinRefused: Boolean = false): List<WppAction> {
         stage = WppStage.FAILED
-        return listOf(WppAction.Fail(reason, phoneWasSilent = messagesReceived == 0))
+        return listOf(
+            WppAction.Fail(reason, phoneWasSilent = messagesReceived == 0, joinRefused = joinRefused)
+        )
     }
 
     /**

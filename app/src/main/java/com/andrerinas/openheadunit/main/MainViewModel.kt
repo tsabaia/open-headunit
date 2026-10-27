@@ -8,25 +8,48 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.MutableLiveData
 import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.connection.usb.UsbDeviceCompat
+import com.andrerinas.openheadunit.connection.usb.UsbDeviceDiagnostics
 import com.andrerinas.openheadunit.connection.usb.UsbReceiver
+import com.andrerinas.openheadunit.utils.AppLog
 import com.andrerinas.openheadunit.utils.Settings
 
 class MainViewModel(application: Application): AndroidViewModel(application), UsbReceiver.Listener {
 
     val usbDevices = MutableLiveData<List<UsbDeviceCompat>>()
 
+    /**
+     * Set each time the Home button lands on this app as the launcher, so the home goes back to
+     * its first page the way any launcher does. Kept, not consumed: a home view created later
+     * starts on the first page anyway, so seeing an old value again changes nothing.
+     */
+    val homePressed = MutableLiveData<Long>()
+
+    /**
+     * True while the home is on screen. Its main button and its connection tiles tell the
+     * bring-up there, so the status pill would only cover the favorites row with the same words.
+     */
+    val homeShowsBringUp = MutableLiveData(false)
+
     private val app: App
         get() = getApplication()
     private val settings = Settings(application)
     private val usbReceiver = UsbReceiver(this)
+    private var isRegistered = false
 
     fun register() {
-        ContextCompat.registerReceiver(app, usbReceiver, UsbReceiver.createFilter(), ContextCompat.RECEIVER_NOT_EXPORTED)
+        // The model outlives a recreated MainActivity (a rotation, for one), and a second
+        // registration would deliver every USB event twice.
+        if (!isRegistered) {
+            ContextCompat.registerReceiver(app, usbReceiver, UsbReceiver.createFilter(), ContextCompat.RECEIVER_NOT_EXPORTED)
+            isRegistered = true
+        }
         usbDevices.value = createDeviceList(settings.allowedDevices)
     }
 
+    // Only MainActivity registers. SettingsActivity shares the nav graph, so it briefly hosts a
+    // HomeFragment that asks for this model too, and unregistering there throws.
     override fun onCleared() {
-        app.unregisterReceiver(usbReceiver)
+        if (isRegistered) app.unregisterReceiver(usbReceiver)
         super.onCleared()
     }
 
@@ -47,7 +70,11 @@ class MainViewModel(application: Application): AndroidViewModel(application), Us
     }
 
     private fun createDeviceList(allowDevices: Set<String>): List<UsbDeviceCompat> {
-        val manager = app.getSystemService(android.content.Context.USB_SERVICE) as UsbManager
+        val manager = UsbDeviceCompat.usbManager(app) ?: run {
+            AppLog.w("MainViewModel: USB service is unavailable; USB device list is empty")
+            return emptyList()
+        }
+        UsbDeviceDiagnostics.logDeviceList(app, manager, "USB list")
         val devices = manager.deviceList.values.map { UsbDeviceCompat(it) }
         return filterAndSort(devices, allowDevices)
     }

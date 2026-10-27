@@ -22,7 +22,11 @@ object AppLog {
 
         class Android : Logger {
             override fun println(priority: Int, tag: String, msg: String) {
-                Log.println(priority, TAG, msg)
+                try {
+                    Log.println(priority, TAG, msg)
+                } catch (_: RuntimeException) {
+                    // Running in a pure JVM unit test environment where android.util.Log is not mocked
+                }
             }
         }
 
@@ -253,6 +257,13 @@ object AppLog {
     @JvmStatic
     fun w(msg: String, vararg params: Any) {
         if (isLoggable(Log.WARN)) log(Log.WARN, format(msg, *params))
+    }
+
+    /** Preserve the producer's origin when a worker emits a previously collected event. */
+    internal fun tagged(priority: Int, origin: String, message: String) {
+        if (isLoggable(priority)) {
+            log(priority, "[${Thread.currentThread().id}] $origin | $message")
+        }
     }
 
     private fun log(priority: Int, msg: String) {

@@ -1,20 +1,35 @@
 package com.andrerinas.openheadunit.utils
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.SystemClock
+import android.widget.Toast
 import android.util.Log
 import androidx.core.content.FileProvider
 import com.andrerinas.openheadunit.BuildConfig
+import com.andrerinas.openheadunit.R
+import com.andrerinas.openheadunit.connection.wifi.WifiLauncherMode
+import com.andrerinas.openheadunit.connection.wifi.direct.StationStandDown
+import com.andrerinas.openheadunit.connection.wifi.direct.StationStandDownMode
+import com.andrerinas.openheadunit.connection.wifi.direct.WifiBandCapability
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.ExternalBtTransportPolicy
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.NativeAaHandshakeManager
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.zbt.ZbtDiscovery
 import com.andrerinas.openheadunit.decoder.video.VideoFaultInjector
+import com.andrerinas.openheadunit.decoder.audio.AudioDiagnostics
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.security.MessageDigest
 
 object LogExporter {
 
@@ -133,15 +148,77 @@ object LogExporter {
         val settings = Settings(context)
         return "LogExporter: session | " +
             "build=${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) " +
-            "${BuildConfig.FLAVOR}/${BuildConfig.BUILD_TYPE} | " +
+            "${BuildConfig.FLAVOR}/${BuildConfig.BUILD_TYPE} " +
+            // The commit is the only field that separates two candidates of the same fix: the
+            // version name and code do not move between them.
+            "commit=${BuildConfig.GIT_SHA} | " +
             "device=${Build.MANUFACTURER} ${Build.MODEL} board=${Build.BOARD} api=${Build.VERSION.SDK_INT} | " +
             "video=codec:${settings.videoCodec} fps:${settings.fpsLimit} resId:${settings.resolutionId} " +
             "view:${settings.viewMode.name} forceSw:${settings.forceSoftwareDecoding} " +
             "swDecoder:${settings.softwareVideoDecoder.name} | " +
-            "wifi=mode:${settings.wifiConnectionMode} strategy:${settings.helperConnectionStrategy} | " +
+            // These are saved preferences; AudioMixer separately reports the actual backend.
+            "audioPrefs=aaudio:${settings.useAAudioOutput} aac:${settings.useAacAudio} " +
+            "latency:${settings.audioLatencyMultiplier} queue:${settings.audioQueueCapacity} | " +
+            "wifi=mode:${settings.wifiConnectionMode} strategy:${wifiTransport(settings)} " +
+            // The band and the stand-down arm decide how a stuttering capture reads, and both are
+            // otherwise only in lines that rotate out of a head unit's buffer within a minute.
+            "band:${band(context)} standDown:${standDown(settings)} autoHotspot:${if (settings.autoEnableHotspot) "on" else "off"} | " +
+            // Which Bluetooth this unit will use. A capture that shows the handshake doing nothing
+            // reads completely differently once the header says the route was blocked.
+            "bt=${bluetoothRoute(context)} | " +
             "logLevel=${settings.exporterLogLevel.name} | " +
             "debug=${debugLevers(settings)}"
     }
+
+    /**
+     * Which bands this unit's radio has, or why nobody knows.
+     *
+     * `unasked` and `unknown` are kept apart on purpose: the first is a platform too old to have
+     * the call, the second is a WiFi service that refused on a unit that does have it.
+     */
+    private fun band(context: Context): String = when {
+        WifiBandCapability.bandUnreadable() -> "unasked"
+        else -> when (WifiBandCapability.supports5Ghz(context)) {
+            true -> "5ghz"
+            false -> "2.4only"
+            null -> "unknown"
+        }
+    }
+
+    /** The stand-down setting, and what the last bring-up in this process actually did with it. */
+    private fun standDown(settings: Settings): String =
+        "${StationStandDownMode.fromSetting(settings.stationStandDownMode)}/" +
+            StationStandDown.lastOutcome.token
+
+    /** Label ordinary hardware, a firmware candidate, or an established module with its route; never dial. */
+    private fun bluetoothRoute(context: Context): String {
+        val discovery = ZbtDiscovery.snapshot()
+        val decision = discovery.decision
+        // HCT can route with no ZBT markers, which the decision below would call internal.
+        if (NativeAaHandshakeManager.transportRoute(context, discovery) == ExternalBtTransportPolicy.Route.HCT) {
+            return "module:HCT"
+        }
+        return when {
+            !decision.available -> "internal"
+            decision.requiresIdentity -> "zbt-candidate:${NativeAaHandshakeManager.transportRoute(context, discovery)}"
+            else -> "module:${NativeAaHandshakeManager.transportRoute(context, discovery)}"
+        }
+    }
+
+    /**
+     * The transport selector that the reported mode actually reads.
+     *
+     * Native AA has its own, `nativeApStrategy`, and reads `helperConnectionStrategy` nowhere. This
+     * line printed the helper's for every mode, so a Native capture opened with a value nothing in
+     * that mode consults - which meant a header could not tell a Native/WiFi-Direct failure from a
+     * Native/hotspot one, and reading it literally sent triage after a Nearby path that never ran.
+     */
+    private fun wifiTransport(settings: Settings): String =
+        if (settings.wifiConnectionMode == WifiLauncherMode.NATIVE) {
+            settings.nativeApStrategy.name
+        } else {
+            settings.helperConnectionStrategy.name
+        }
 
     /**
      * The settings that make the app behave unlike itself, in the one line every capture opens with.
@@ -283,9 +360,8 @@ object LogExporter {
             return@withContext null
         }
 
-        // Before every path below, because this is the only one that reaches AppLog's own file.
-        // The two logcat paths do not trust it to arrive and append it themselves - see
-        // appendBanner. A second copy in a capture file costs a line and is worth it.
+        // Emit the banner to live logging too. Every export path also appends it directly
+        // with retained audio events, without waiting for the asynchronous log writer.
         AppLog.w(sessionBanner(context))
 
         val settings = Settings(context)
@@ -293,6 +369,7 @@ object LogExporter {
         if (AppLog.logSource == Settings.LogSource.APPLOG_FILE) {
             return@withContext (AppLog.currentLogFile ?: AppLog.lastLogFile)
                 ?.takeIf { it.exists() && it.length() > 0 }
+                ?.also { appendBanner(it, context) }
         }
 
         val logDir = LogFilesHelper.resolveLogDirectory(context, settings, allowInternalFallback = false)
@@ -338,8 +415,28 @@ object LogExporter {
      */
     private fun appendBanner(file: File, context: Context) {
         try {
+            // Export runs on Dispatchers.IO. Read the installed artifact here, never on the
+            // mixer/transport path; a release tag or version name alone cannot identify its bytes.
+            val apkHash = try {
+                val digest = MessageDigest.getInstance("SHA-256")
+                FileInputStream(context.applicationInfo.sourceDir).use { apk ->
+                    val buffer = ByteArray(8192)
+                    while (true) {
+                        val read = apk.read(buffer)
+                        if (read < 0) break
+                        digest.update(buffer, 0, read)
+                    }
+                }
+                digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            } catch (e: Exception) {
+                "unavailable:${e.javaClass.simpleName}"
+            }
             FileOutputStream(file, true).use {
-                it.write("\n${sessionBanner(context)}\n".toByteArray())
+                it.write(("\n${sessionBanner(context)}\n" +
+                    "LogExporter: exportArtifact commit=${BuildConfig.GIT_SHA} baseApkSha256=$apkHash " +
+                    "exportElapsedMs=${SystemClock.elapsedRealtime()} " +
+                    "(identifies the exporting app; earlier captured sessions may differ)\n" +
+                    AudioDiagnostics.snapshot(SystemClock.elapsedRealtime()) + "\n").toByteArray())
             }
         } catch (e: Exception) {
             AppLog.w("LogExporter: could not write the session banner into ${file.name}: ${e.message}")
@@ -397,17 +494,102 @@ object LogExporter {
         logFile
     }
 
+    /**
+     * Shares an exported log.
+     *
+     * Every step is guarded, because this runs from a dialog's click handler and a throw there
+     * kills the app: a log outside the provider's declared roots used to do exactly that, so the
+     * one button a reporter needs crashed instead of sending the file.
+     */
     fun shareLogFile(context: Context, file: File) {
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        try {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
 
-        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            val chooser = Intent.createChooser(shareIntent, "Share Log File")
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(chooser)
+        } catch (e: Exception) {
+            // The path, because the reporter can still fetch the file by hand from there.
+            AppLog.e("LogExporter: could not share ${file.absolutePath}: ${e.message}", e)
+            ToastUtils.showToast(
+                context,
+                context.getString(R.string.failed_export_logs),
+                Toast.LENGTH_LONG,
+                force = true
+            )
         }
+    }
 
-        val chooser = Intent.createChooser(shareIntent, "Share Log File")
-        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(chooser)
+    // Capped at 250 KB to guarantee safe Android Binder IPC transaction limits on older
+    // Android versions (Android 4.1 - 7.x have a shared 1 MB process-wide Binder buffer).
+    internal const val CLIPBOARD_SAFE_LIMIT_BYTES = 250 * 1024
+
+    suspend fun copyLogToClipboard(context: Context, verbosity: LogLevel): Boolean = withContext(Dispatchers.IO) {
+        if (verbosity == LogLevel.SILENT) {
+            AppLog.w("LogExporter: clipboard copy requested while SILENT; skipping")
+            return@withContext false
+        }
+        val logFile = saveLogToPublicFile(context, verbosity) ?: return@withContext false
+        copyFileToClipboard(context, logFile)
+    }
+
+    fun copyFileToClipboard(context: Context, logFile: File): Boolean {
+        return try {
+            val content = readLogFileForClipboard(logFile)
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("OpenHeadunit Log", content)
+            clipboard.setPrimaryClip(clip)
+            AppLog.i("LogExporter: copied ${content.length} chars (${content.toByteArray(Charsets.UTF_8).size} bytes) to clipboard")
+            true
+        } catch (e: Exception) {
+            AppLog.e("LogExporter: failed to copy log to clipboard", e)
+            false
+        }
+    }
+
+    internal fun readLogFileForClipboard(file: File): String {
+        val fileLen = file.length()
+        if (fileLen <= CLIPBOARD_SAFE_LIMIT_BYTES) {
+            return file.readText(Charsets.UTF_8)
+        }
+        val headBytes = 50 * 1024L
+        val tailBytes = (CLIPBOARD_SAFE_LIMIT_BYTES - headBytes).coerceAtLeast(0L)
+        val head = FileInputStream(file).use { fis ->
+            val buf = ByteArray(headBytes.toInt())
+            var read = 0
+            while (read < buf.size) {
+                val n = fis.read(buf, read, buf.size - read)
+                if (n < 0) break
+                read += n
+            }
+            String(buf, 0, read, Charsets.UTF_8)
+        }
+        val skipAmount = (fileLen - tailBytes).coerceAtLeast(0L)
+        val tail = FileInputStream(file).use { fis ->
+            var skipped = 0L
+            while (skipped < skipAmount) {
+                val n = fis.skip(skipAmount - skipped)
+                if (n <= 0) break
+                skipped += n
+            }
+            fis.reader(Charsets.UTF_8).readText()
+        }
+        val kbTotal = fileLen / 1024
+        val kbCopied = CLIPBOARD_SAFE_LIMIT_BYTES / 1024
+        val omittedBytes = (fileLen - headBytes - tailBytes).coerceAtLeast(0L)
+        return buildString {
+            append("[TRUNCATED for clipboard: full log is ${kbTotal} KB; only ~${kbCopied} KB shown below.]\n")
+            append("=== BEGINNING OF LOG ===\n")
+            append(head)
+            append("\n\n=== [${String.format("%,d", omittedBytes)} bytes omitted in the middle] ===\n\n")
+            append("=== END OF LOG (most recent lines, most likely to contain errors) ===\n")
+            append(tail)
+        }
     }
 }

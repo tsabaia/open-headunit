@@ -22,6 +22,7 @@ class DummyVpnPolicyTest {
             setOf(
                 Reason.SESSION_ENDED,
                 Reason.SELF_MODE_NEVER_CONNECTED,
+                Reason.SELF_MODE_SESSION_LIVE,
                 Reason.SERVICE_DESTROYED,
             ),
             Reason.entries.toSet()
@@ -44,6 +45,12 @@ class DummyVpnPolicyTest {
         // attached to a live connection, so the watchdog must never reach one.
         assertTrue(DummyVpnPolicy.shouldStop(Owner.SELF_MODE, Reason.SELF_MODE_NEVER_CONNECTED))
         assertFalse(DummyVpnPolicy.shouldStop(Owner.SESSION, Reason.SELF_MODE_NEVER_CONNECTED))
+    }
+
+    @Test
+    fun `a live self mode session releases only a self mode VPN`() {
+        assertTrue(DummyVpnPolicy.shouldStop(Owner.SELF_MODE, Reason.SELF_MODE_SESSION_LIVE))
+        assertFalse(DummyVpnPolicy.shouldStop(Owner.SESSION, Reason.SELF_MODE_SESSION_LIVE))
     }
 
     @Test
@@ -99,5 +106,11 @@ class DummyVpnPolicyTest {
         assertFalse(start(nativeWirelessSession = false))
         assertFalse(start(nativeWirelessSession = false, selfMode = true))
         assertFalse(start(nativeWirelessSession = false, alreadyPrepared = false))
+    }
+    @Test
+    fun `session VPN requires per app exclusion but legacy Self ownership still works`() {
+        for (sdk in 16..20) assertFalse(DummyVpnPolicy.supportsSessionVpn(sdk))
+        for (sdk in 21..36) assertTrue(DummyVpnPolicy.supportsSessionVpn(sdk))
+        assertTrue(DummyVpnPolicy.shouldStop(Owner.SELF_MODE, Reason.SELF_MODE_NEVER_CONNECTED))
     }
 }

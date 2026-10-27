@@ -6,6 +6,8 @@ import android.os.Build
 import android.widget.Toast
 import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.R
+import com.andrerinas.openheadunit.connection.ConnectionStage
+import com.andrerinas.openheadunit.connection.ConnectionStageTracker
 import com.andrerinas.openheadunit.connection.wifi.modes.helper.NearbyManager
 import com.andrerinas.openheadunit.connection.wifi.modes.helper.HelperStrategy
 import com.andrerinas.openheadunit.connection.wifi.WifiLauncher
@@ -44,6 +46,8 @@ class WifiLauncherHelper : WifiLauncher {
 
     override fun hasWifiDirect() = strategy == HelperStrategy.WIFI_DIRECT
 
+    override fun hostsOwnAccessPoint() = strategy == HelperStrategy.HEADUNIT_HOTSPOT
+
     override fun hasWirelessServer() = true
 
     override fun hasLocalDiscovery(): Boolean {
@@ -53,6 +57,7 @@ class WifiLauncherHelper : WifiLauncher {
 
     override fun start(noInfoToasts: Boolean) {
         AppLog.i("WifiLauncher: Using strategy $strategy.")
+        ConnectionStageTracker.report(ConnectionStage.SEARCHING)
 
         when (strategy) {
             HelperStrategy.COMMON_WIFI -> { /* #startDiscovery(oneShot = false) handled by SharedServices */ }
@@ -61,6 +66,7 @@ class WifiLauncherHelper : WifiLauncher {
                 val wifiDirect = manager.sharedServices.wifiDirectManager!!
 
                 if (wifiManager.isWifiEnabled) {
+                    ConnectionStageTracker.report(ConnectionStage.CREATING_NETWORK)
                     wifiDirect.makeVisible()
                 } else if (!noInfoToasts) {
                     ToastUtils.showToast(service, service.getString(R.string.wifi_disabled_info), Toast.LENGTH_SHORT)
@@ -77,8 +83,19 @@ class WifiLauncherHelper : WifiLauncher {
         if (settings.autoEnableHotspot && strategy == HelperStrategy.HEADUNIT_HOTSPOT) {
             service.serviceScope.launch {
                 AppLog.i("AapService: Auto-enabling hotspot for Helper mode...")
+                ConnectionStageTracker.report(ConnectionStage.PREPARING_NETWORK)
                 HotspotManager.setHotspotEnabled(service, true)
             }
+        }
+    }
+
+    /** A settings retry may overlap association; refreshing must not rebuild its network. */
+    fun refreshAfterSettingsRestart() {
+        manager.sharedServices.startWirelessServer(this)
+        when (strategy) {
+            HelperStrategy.WIFI_DIRECT -> manager.sharedServices.wifiDirectManager?.refreshHelperGroup()
+            HelperStrategy.NEARBY_DEVICES -> nearbyManager?.resumeDiscoveryIfIdle()
+            else -> restartDiscovery()
         }
     }
 
@@ -119,12 +136,10 @@ class WifiLauncherHelper : WifiLauncher {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             try {
-                nearbyManager = NearbyManager(service, service.serviceScope) { socket ->
+                nearbyManager = NearbyManager(service, service.serviceScope) { socket, admission ->
                     val appSettings = App.provide(service).settings
-                    appSettings.saveLastConnection(Settings.CONNECTION_TYPE_NEARBY)
-                    service.serviceScope.launch(Dispatchers.IO) {
-                        App.provide(service).commManager.connect(socket)
-                    }
+                    admission.run { appSettings.saveLastConnection(Settings.CONNECTION_TYPE_NEARBY) }
+                    App.provide(service).commManager.connect(socket, admission = admission)
                 }
             } catch (e: Exception) {
                 AppLog.e("AapService: Failed to init NearbyManager: ${e.message}")

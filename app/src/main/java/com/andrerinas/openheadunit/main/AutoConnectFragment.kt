@@ -18,6 +18,7 @@ import com.andrerinas.openheadunit.main.settings.AutoConnectAdapter
 import com.andrerinas.openheadunit.main.settings.AutoConnectMethod
 import com.andrerinas.openheadunit.main.settings.AutoConnectTouchCallback
 import com.andrerinas.openheadunit.utils.Settings
+import com.andrerinas.openheadunit.utils.ToastUtils
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.button.MaterialButton
 
@@ -259,7 +260,7 @@ class AutoConnectFragment : Fragment() {
         enabledStates[Settings.AUTO_CONNECT_LAST_SESSION]?.let { settings.autoConnectLastSession = it }
         enabledStates[Settings.AUTO_CONNECT_SELF_MODE]?.let { settings.autoStartSelfMode = it }
         enabledStates[Settings.AUTO_CONNECT_SINGLE_USB]?.let { settings.autoConnectSingleUsbDevice = it }
-        settings.autoConnectDelaySeconds = pendingDelaySeconds
+        if (pendingDelaySeconds != settings.autoConnectDelaySeconds) settings.autoConnectDelaySeconds = pendingDelaySeconds
 
         // Update snapshot
         initialOrder = orderedIds.toList()
@@ -269,6 +270,6 @@ class AutoConnectFragment : Fragment() {
         hasChanges = false
         updateSaveButtonState()
 
-        Toast.makeText(context, getString(R.string.settings_saved), Toast.LENGTH_SHORT).show()
+        ToastUtils.showToast(context, getString(R.string.settings_saved), Toast.LENGTH_SHORT, force = true)
     }
 }

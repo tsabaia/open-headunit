@@ -22,6 +22,13 @@
             app:exitAnim="@anim/slide_out_left"
             app:popEnterAnim="@anim/slide_in_left"
             app:popExitAnim="@anim/slide_out_right" />
+        <action
+            android:id="@+id/action_homeFragment_to_appDrawerFragment"
+            app:destination="@id/appDrawerFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
     </fragment>
 
     <fragment
@@ -59,6 +66,13 @@
         <action
             android:id="@+id/action_settingsFragment_to_darkModeFragment"
             app:destination="@id/darkModeFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
+        <action
+            android:id="@+id/action_settingsFragment_to_performanceOverlaySettingsFragment"
+            app:destination="@id/performanceOverlaySettingsFragment"
             app:enterAnim="@anim/slide_in_right"
             app:exitAnim="@anim/slide_out_left"
             app:popEnterAnim="@anim/slide_in_left"
@@ -120,6 +134,13 @@
             app:exitAnim="@anim/slide_out_left"
             app:popEnterAnim="@anim/slide_in_left"
             app:popExitAnim="@anim/slide_out_right" />
+        <action
+            android:id="@+id/action_settingsFragment_to_deviceSpecificSettingsFragment"
+            app:destination="@id/deviceSpecificSettingsFragment"
+            app:enterAnim="@anim/slide_in_right"
+            app:exitAnim="@anim/slide_out_left"
+            app:popEnterAnim="@anim/slide_in_left"
+            app:popExitAnim="@anim/slide_out_right" />
     </fragment>
 
 
@@ -153,6 +174,16 @@
         android:id="@+id/dpiSettingsFragment"
         android:name="com.andrerinas.openheadunit.main.DpiSettingsFragment"
         android:label="@string/dpi" />
+
+    <fragment
+        android:id="@+id/performanceOverlaySettingsFragment"
+        android:name="com.andrerinas.openheadunit.main.PerformanceOverlaySettingsFragment"
+        android:label="@string/performance_overlay_settings" />
+
+    <fragment
+        android:id="@+id/deviceSpecificSettingsFragment"
+        android:name="com.andrerinas.openheadunit.main.DeviceSpecificSettingsFragment"
+        android:label="@string/device_specific_settings" />
 
     <fragment
         android:id="@+id/darkModeFragment"
@@ -242,4 +273,13 @@
         android:name="com.andrerinas.openheadunit.main.CustomizationFragment"
         android:label="@string/customization_title" />
 
+    <fragment
+        android:id="@+id/appDrawerFragment"
+        android:name="com.andrerinas.openheadunit.main.AppDrawerFragment"
+        android:label="@string/apps" />
+
+    <fragment
+        android:id="@+id/wifiScanSettingsFragment"
+        android:name="com.andrerinas.openheadunit.connection.wifi.scan.WifiScanSettingsFragment"
+        android:label="@string/wifi_scan_title" />
 </navigation>

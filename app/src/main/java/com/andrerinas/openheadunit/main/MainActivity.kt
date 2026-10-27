@@ -17,6 +17,7 @@ import android.os.Bundle
 import android.view.KeyEvent
 import android.view.View
 import android.widget.FrameLayout
+import android.widget.TextView
 import android.widget.ImageView
 import android.widget.Toast
 import android.widget.VideoView
@@ -28,15 +29,25 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.andrerinas.openheadunit.connection.ConnectionPriorityPolicy
 import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.R
 import com.andrerinas.openheadunit.aap.AapProjectionActivity
 import com.andrerinas.openheadunit.aap.AapService
 import com.andrerinas.openheadunit.aap.NativeTransport
+import com.andrerinas.openheadunit.aap.ProjectionWatchdogPolicy
 import com.andrerinas.openheadunit.app.BaseActivity
+import com.andrerinas.openheadunit.app.BtAutoStartRearmPolicy
 import com.andrerinas.openheadunit.connection.CommManager
+import com.andrerinas.openheadunit.connection.ConnectionNetworkDetail
+import com.andrerinas.openheadunit.connection.ConnectionNetworkDetailPolicy
+import com.andrerinas.openheadunit.connection.ConnectionStage
+import com.andrerinas.openheadunit.connection.ConnectionStageTracker
+import com.andrerinas.openheadunit.connection.PhoneExitQuietPolicy
 import com.andrerinas.openheadunit.utils.AppLog
 import com.andrerinas.openheadunit.utils.AppPermissions
+import com.andrerinas.openheadunit.utils.CarLauncherManager
+import com.andrerinas.openheadunit.utils.OnboardingLauncherPolicy
 import com.andrerinas.openheadunit.utils.ConnectionIssue
 import com.andrerinas.openheadunit.utils.ConnectionIssues
 import android.content.res.Configuration
@@ -44,9 +55,12 @@ import com.andrerinas.openheadunit.utils.Settings
 import android.os.SystemClock
 import com.andrerinas.openheadunit.connection.wifi.WifiLauncherMode
 import com.andrerinas.openheadunit.utils.SystemUI
+import com.andrerinas.openheadunit.utils.ToastUtils
 import com.bumptech.glide.Glide
 import com.bumptech.glide.request.target.CustomTarget
 import com.bumptech.glide.request.transition.Transition
+import com.andrerinas.openheadunit.utils.WifiStackRecovery
+import com.andrerinas.openheadunit.utils.OemAppManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
@@ -66,6 +80,12 @@ class MainActivity : BaseActivity() {
     private val viewModel: MainViewModel by viewModels()
 
     private var autoConnectWatchdog: Job? = null
+    private var renderedStage: ConnectionStage? = null
+    private var loggedStage: ConnectionStage? = null
+
+    /** Ends the hold after a clean phone-side exit; the flow itself emits nothing at that moment. */
+    private var phoneExitQuietJob: Job? = null
+    private var renderedNetwork: ConnectionNetworkDetail? = null
     private var autoConnectKenBurnsAnim: ObjectAnimator? = null
 
     /**
@@ -73,9 +93,11 @@ class MainActivity : BaseActivity() {
      * non-blocking status indicator at the top of the home screen used for
      * fully automatic background attempts so the home buttons stay tappable.
      * OVERLAY is the full-screen custom loading screen used for connections
-     * the user explicitly triggered with a button.
+     * the user explicitly triggered with a button. PILL_THEN_OVERLAY starts as
+     * the pill and becomes the overlay once the connection actually advances,
+     * for an attempt whose phone still has to be woken and may never answer.
      */
-    enum class ConnectionUiMode { PILL, OVERLAY }
+    enum class ConnectionUiMode { PILL, OVERLAY, PILL_THEN_OVERLAY }
 
     private val finishReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: android.content.Context, intent: Intent) {
@@ -147,24 +169,65 @@ class MainActivity : BaseActivity() {
         setTheme(R.style.AppTheme)
         val mainSettings = Settings(this)
         val isNightActive = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
-        if (mainSettings.appTheme == Settings.AppTheme.EXTREME_DARK ||
-            (mainSettings.useExtremeDarkMode && isNightActive)) {
+        val isExtremeDark = mainSettings.appTheme == Settings.AppTheme.EXTREME_DARK ||
+            (mainSettings.useExtremeDarkMode && isNightActive)
+        if (isExtremeDark) {
             theme.applyStyle(R.style.ThemeOverlay_ExtremeDark, true)
         } else if (mainSettings.useGradientBackground) {
             theme.applyStyle(R.style.ThemeOverlay_GradientBackground, true)
         }
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
+        if (Build.VERSION.SDK_INT >= 26) {
+            lifecycleScope.launch {
+                repeatOnLifecycle(Lifecycle.State.STARTED) {
+                    var notice: com.google.android.material.snackbar.Snackbar? = null
+                    try {
+                        while (true) {
+                            val state = com.andrerinas.openheadunit.connection.wifi.scan.WifiScanControl.state.value
+                            val adbRecovery = com.andrerinas.openheadunit.connection.wifi.scan.FytShizukuStarter.needsRecovery(this@MainActivity)
+                            if (adbRecovery || state == com.andrerinas.openheadunit.connection.wifi.scan.WifiScanControl.State.RECOVERY) {
+                                if (notice == null) {
+                                    notice = com.google.android.material.snackbar.Snackbar.make(
+                                        findViewById(android.R.id.content), if (adbRecovery) R.string.wifi_scan_fyt_recovery else R.string.wifi_scan_recovery_notice,
+                                        com.google.android.material.snackbar.Snackbar.LENGTH_INDEFINITE
+                                    ).setAction(R.string.wifi_scan_restore_short) {
+                                        startActivity(Intent(this@MainActivity, SettingsActivity::class.java)
+                                            .putExtra(SettingsActivity.EXTRA_SEARCH_QUERY, getString(R.string.wifi_scan_title)))
+                                    }
+                                    notice?.show()
+                                }
+                            } else if (state != com.andrerinas.openheadunit.connection.wifi.scan.WifiScanControl.State.WORKING) {
+                                notice?.dismiss(); notice = null
+                            }
+                            kotlinx.coroutines.delay(1_000)
+                        }
+                    } finally { notice?.dismiss() }
+                }
+            }
+        }
+        if (isExtremeDark) {
+            findViewById<View>(R.id.splash_overlay)?.setBackgroundColor(
+                ContextCompat.getColor(this, R.color.extreme_dark_background)
+            )
+        }
         applyCustomHomeBackground()
 
         val appSettings = Settings(this)
         requestedOrientation = appSettings.screenOrientation.androidOrientation
 
-        // Sync UsbAttachedActivity component state with the listen for USB devices setting.
-        // This covers first install, app updates (manifest may reset component state),
-        // and ensures the USB system modal only appears when the user has opted in to listen for ALL USB devices.
+        // Sync UsbAttachedActivity and CarLauncher component states with settings.
         lifecycleScope.launch(Dispatchers.IO) {
             Settings.setUsbAttachedActivityEnabled(applicationContext, appSettings.listenForUsbDevices)
+            val launcherStored = appSettings.enableCarLauncher
+            val held = CarLauncherManager.isDefaultLauncher(applicationContext)
+            if (OnboardingLauncherPolicy.syncsAlias(launcherStored, held)) {
+                CarLauncherManager.syncWithSettings(applicationContext, launcherStored)
+            } else {
+                // A granted home role starts this screen and clears the one that asked, before it can store the mode.
+                appSettings.enableCarLauncher = OnboardingLauncherPolicy.launcherModeOnOpen(launcherStored, held)
+                AppLog.i("MainActivity: the app is the home app with launcher mode not stored yet, storing car launcher mode")
+            }
         }
 
         // Start main service immediately to handle connections and wireless server
@@ -182,32 +245,39 @@ class MainActivity : BaseActivity() {
                 // user isn't trapped if a manual connection attempt hangs. Pill
                 // mode is non-blocking, so Back falls through to its normal
                 // navigation behavior there.
-                if (autoConnectInProgress && autoConnectMode == ConnectionUiMode.OVERLAY) {
+                if (overlayOwnsScreen()) {
                     cancelAutoConnect()
                     return
                 }
                 if (navController.navigateUp()) {
                     return
+                } else if (appSettings.enableCarLauncher || CarLauncherManager.isDefaultLauncher(this@MainActivity)) {
+                    // When in Car Launcher mode or active system Home launcher,
+                    // back press at the root of the app should not finish the launcher.
+                    return
                 } else if (System.currentTimeMillis() - lastBackPressTime < 2000) {
                     finish()
                 } else {
                     lastBackPressTime = System.currentTimeMillis()
-                    Toast.makeText(this@MainActivity, R.string.press_back_again_to_exit, Toast.LENGTH_SHORT).show()
+                    ToastUtils.showToast(this@MainActivity, R.string.press_back_again_to_exit, Toast.LENGTH_SHORT, force = true)
                 }
             }
         })
 
-        val isUsbAutoStart = savedInstanceState == null &&
-            intent?.getStringExtra(EXTRA_LAUNCH_SOURCE) == "USB auto-start"
+        val launchSource = if (savedInstanceState == null) intent?.getStringExtra(EXTRA_LAUNCH_SOURCE) else null
 
-        if (isUsbAutoStart) {
+        if (launchSource == "USB auto-start") {
             findViewById<View>(R.id.splash_overlay)?.visibility = View.GONE
             beginAutoConnect("USB auto-start", ConnectionUiMode.OVERLAY)
+        } else if (launchSource == LAUNCH_SOURCE_BLUETOOTH) {
+            // The connect pill and the Self Mode launch are raised from handleLaunchIntent, so a
+            // warm activity handed the same intent behaves the same way.
+            findViewById<View>(R.id.splash_overlay)?.visibility = View.GONE
         } else if (savedInstanceState == null) {
             val elapsedSinceStart = SystemClock.elapsedRealtime() - App.appStartTime
             val targetTotalDuration = 1200L
             val actualDelay = (targetTotalDuration - elapsedSinceStart).coerceAtLeast(0L)
-
+            findViewById<View>(R.id.splash_overlay)?.bringToFront()
             showSplashWithDelay(actualDelay)
         } else {
             findViewById<View>(R.id.splash_overlay)?.visibility = View.GONE
@@ -226,16 +296,17 @@ class MainActivity : BaseActivity() {
         )
         isFinishReceiverRegistered = true
 
-        // Wire cancel affordances. Pill click and overlay cancel button both
-        // route through the same cancellation path.
-        findViewById<View>(R.id.auto_connect_pill)?.setOnClickListener {
-            cancelAutoConnect()
+        // Wire cancel affordances. The pill's X stops the whole bring-up; the overlay's button
+        // ends only the attempt it belongs to.
+        findViewById<View>(R.id.auto_connect_pill_cancel)?.setOnClickListener {
+            cancelBringUp()
         }
         findViewById<View>(R.id.auto_connect_loading_cancel)?.setOnClickListener {
             cancelAutoConnect()
         }
 
         observeConnectionStateForOverlay()
+        observeConnectionStage()
     }
 
     /**
@@ -251,16 +322,32 @@ class MainActivity : BaseActivity() {
      *        and the user has the show-text option enabled, this string is shown
      *        instead of the generic "Android Auto is starting…". Used by the
      *        Nearby selector to surface the picked device name.
+     * @param statusTextIsWakeClaim true when [customStatusText] says the phone is
+     *        disconnected and being woken; such a text is dropped once the phone
+     *        answers, so it never follows onto the projection screen.
      */
     @JvmOverloads
-    fun beginAutoConnect(reason: String, mode: ConnectionUiMode, customStatusText: String? = null) {
-        if (autoConnectInProgress) return
+    fun beginAutoConnect(
+        reason: String,
+        mode: ConnectionUiMode,
+        customStatusText: String? = null,
+        statusTextIsWakeClaim: Boolean = false
+    ) {
+        // The flag is on the companion and the watchdog on this instance's scope, so an attempt
+        // can reach here with nothing watching it at all: spend it if it is over, re-arm it if not.
+        endAutoConnectIfExpired()
+        if (autoConnectInProgress) {
+            ensureAutoConnectWatchdog(rearmed = true)
+            return
+        }
         val commManager = App.provide(this).commManager
         // If we are already past the connection phase, no indicator is needed.
         if (commManager.isConnected) return
         AppLog.i("Auto-connect: begin ($reason, mode=$mode)")
         autoConnectInProgress = true
         autoConnectMode = mode
+        autoConnectDeadlineElapsed =
+            AutoConnectAttemptPolicy.deadlineAt(mode, SystemClock.elapsedRealtime())
         // Seed hasAdvancedToActiveState from the current connection state. If
         // something else (e.g. AapService responding to a USB attach) already
         // moved the state into Connecting before we got here, the StateFlow
@@ -273,6 +360,7 @@ class MainActivity : BaseActivity() {
                 currentState is CommManager.ConnectionState.Connected ||
                 currentState is CommManager.ConnectionState.StartingTransport
         autoConnectStatusText = customStatusText
+        autoConnectStatusIsWakeClaim = statusTextIsWakeClaim
         // Hand the status text off to AapProjectionActivity so its own loading
         // screen continues to show the same context-specific label after the
         // handshake completes and AAP takes over the UI. AAP reads and clears
@@ -286,8 +374,13 @@ class MainActivity : BaseActivity() {
      * Dispatches to the pill or overlay show-method based on [autoConnectMode].
      */
     private fun showAutoConnectUi() {
+        // Here rather than in the show-methods, so no mode can start an attempt that outlives its
+        // own UI. The promotion to OVERLAY comes back through here, and the bound belongs to the
+        // attempt rather than to the UI it is wearing.
+        ensureAutoConnectWatchdog(rearmed = false)
         when (autoConnectMode) {
-            ConnectionUiMode.PILL -> showAutoConnectPill()
+            ConnectionUiMode.PILL,
+            ConnectionUiMode.PILL_THEN_OVERLAY -> showAutoConnectPill()
             ConnectionUiMode.OVERLAY -> showAutoConnectOverlay()
         }
     }
@@ -310,6 +403,29 @@ class MainActivity : BaseActivity() {
     }
 
     /**
+     * The pill's X, and the new home's Cancel that took the pill's place there: ends the attempt
+     * this activity may be tracking, then has the service stop the stack and hold it down.
+     * [cancelAutoConnect] alone cannot reach the pre-handshake stages, which are the ones the pill
+     * spends most of its life showing.
+     */
+    fun cancelBringUp(source: String = "status pill X") {
+        AppLog.i("MainActivity: $source pressed, stopping the bring-up")
+        // Read before the disconnect below, which drops the connection the service would ask.
+        val stage = ConnectionStageTracker.stage.value
+        val usbAttempt = App.provide(this).commManager.isUsbSession ||
+            stage == ConnectionStage.USB_ATTACHED || stage == ConnectionStage.USB_SWITCHING
+        // The home's own auto-connect countdown lives in HomeFragment, not here. The countdown
+        // only runs while the home's view is up, so the home in the nav host is the one to tell.
+        supportFragmentManager.findFragmentById(R.id.main_content)?.childFragmentManager?.fragments
+            ?.filterIsInstance<HomeFragment>()?.forEach { it.stopAutoConnectCountdown() }
+        cancelAutoConnect()
+        ContextCompat.startForegroundService(this, Intent(this, AapService::class.java).apply {
+            action = AapService.ACTION_CANCEL_WIRELESS
+            putExtra(AapService.EXTRA_USB_ATTEMPT, usbAttempt)
+        })
+    }
+
+    /**
      * Subscribes to [CommManager.connectionState] to drive the auto-connect overlay.
      *
      * Show: when the overlay is requested via [beginAutoConnect] and the connection
@@ -328,15 +444,36 @@ class MainActivity : BaseActivity() {
                         is CommManager.ConnectionState.Connected,
                         is CommManager.ConnectionState.StartingTransport -> {
                             hasAdvancedToActiveState = true
+                            ConnectionStageTracker.report(
+                                if (state is CommManager.ConnectionState.StartingTransport) {
+                                    ConnectionStage.SECURING
+                                } else {
+                                    ConnectionStage.CONNECTING
+                                }
+                            )
                             // The pill/overlay should already be visible (set when auto-connect
                             // was requested); ensure it is in case the request raced with
                             // setContentView or the activity was recreated mid-attempt.
                             if (autoConnectInProgress) {
+                                // A deferred attempt has now proven a phone is answering, so it
+                                // may take the full screen.
+                                if (autoConnectMode == ConnectionUiMode.PILL_THEN_OVERLAY) {
+                                    AppLog.i("Auto-connect: a phone is answering, taking the full screen.")
+                                    autoConnectMode = ConnectionUiMode.OVERLAY
+                                    hideAutoConnectPill()
+                                    // A pill that said this phone was disconnected is answered now,
+                                    // so that text must not follow it onto the projection screen.
+                                    if (autoConnectStatusIsWakeClaim) {
+                                        autoConnectStatusText = null
+                                        AapProjectionActivity.pendingStatusText = null
+                                    }
+                                }
                                 showAutoConnectUi()
                             }
                         }
                         is CommManager.ConnectionState.HandshakeComplete,
                         is CommManager.ConnectionState.TransportStarted -> {
+                            ConnectionStageTracker.report(ConnectionStage.STARTING_PROJECTION)
                             // AapProjectionActivity is launching (HandshakeComplete) or
                             // has launched (TransportStarted). Hide our overlay so we
                             // don't keep video/animation resources alive while AAP
@@ -370,17 +507,25 @@ class MainActivity : BaseActivity() {
         autoConnectWatchdog?.cancel()
         autoConnectWatchdog = null
         autoConnectInProgress = false
+        autoConnectDeadlineElapsed = 0L
         hasAdvancedToActiveState = false
         autoConnectStatusText = null
+        autoConnectStatusIsWakeClaim = false
         if (!success) {
             // Failure path: AAP is not going to launch, so clear the handover
             // value so it can't appear on a later, unrelated connection. On
             // success we leave it alone, AAP either already consumed it in
             // onCreate or is about to.
             AapProjectionActivity.pendingStatusText = null
+            // The stack is still armed after a failure, so the pill stays up and falls back to its
+            // resting line. beginAttempt, not report: ARMED ranks below whatever it reached.
+            if (AutoConnectAttemptPolicy.resetsStageOnFailure(autoConnectMode) &&
+                ConnectionStageTracker.stage.value != null
+            ) {
+                ConnectionStageTracker.beginAttempt(ConnectionStage.ARMED)
+            }
+            renderStagePill(ConnectionStageTracker.stage.value)
         }
-        // Pill cleanup is cheap and safe to run regardless of mode.
-        hideAutoConnectPill()
         if (success) {
             // Launch the projection activity directly rather than waiting for the
             // phone to request video focus (AapControl.gainVideoFocus() -> AapBroadcastReceiver).
@@ -401,22 +546,47 @@ class MainActivity : BaseActivity() {
     }
 
     private fun showAutoConnectPill() {
-        // Watchdog backstop applies to pill mode too so the indicator can't
-        // get stuck if the connection attempt never produces an event.
-        if (autoConnectWatchdog?.isActive != true) {
-            startAutoConnectWatchdog()
+        val pill = findViewById<View>(R.id.auto_connect_pill) ?: return
+        val stage = ConnectionStageTracker.stage.value
+        val title = applyPillTitle(stage)
+        if (pill.visibility == View.VISIBLE) {
+            // An attempt that starts while the pill only waited turns the step back into the
+            // second line; nothing else would bring it back until the next step.
+            applyStageText(stage.takeIf { title != StatusPillPolicy.Title.STEP }, animate = true)
+            return
         }
 
-        val pill = findViewById<View>(R.id.auto_connect_pill) ?: return
-        val pillText = findViewById<android.widget.TextView>(R.id.auto_connect_pill_text)
-        pillText?.text = autoConnectStatusText ?: getString(R.string.android_auto_starting)
-        if (pill.visibility == View.VISIBLE) return
-
+        // After the guard, so a pill that is merely changing step still gets the crossfade below.
+        // Reading the tracker here is what restores the step line after an activity recreate.
+        applyStageText(stage.takeIf { title != StatusPillPolicy.Title.STEP }, animate = false)
+        applyNetworkText(ConnectionStageTracker.network.value, animate = false)
         pill.visibility = View.VISIBLE
-        pill.bringToFront()
-        // Suppress the launch splash if it is still up so the pill is visible
-        // immediately on auto-connect from a cold start.
-        findViewById<View>(R.id.splash_overlay)?.visibility = View.GONE
+        // The pill lives in the notice stack, so the stack is what has to come up.
+        findViewById<View>(R.id.status_notices)?.bringToFront()
+        // If the splash overlay is still showing, keep it on top of the pill until the splash finishes
+        findViewById<View>(R.id.splash_overlay)?.let { splash ->
+            if (splash.visibility == View.VISIBLE) {
+                splash.bringToFront()
+            }
+        }
+    }
+
+    /**
+     * The pill's first line and its spinner. A stack that only waits for the phone shows the step
+     * there, without the spinner, so the pill does not claim a start that is not happening (#1147).
+     */
+    private fun applyPillTitle(stage: ConnectionStage?): StatusPillPolicy.Title {
+        val title = stage?.let {
+            StatusPillPolicy.title(it, autoConnectInProgress, hasCustomText = autoConnectStatusText != null)
+        } ?: StatusPillPolicy.Title.STARTING
+        findViewById<TextView>(R.id.auto_connect_pill_text)?.text = when (title) {
+            StatusPillPolicy.Title.CUSTOM -> autoConnectStatusText
+            StatusPillPolicy.Title.STEP -> stage?.let { getString(it.label) }
+            StatusPillPolicy.Title.STARTING -> getString(R.string.android_auto_starting)
+        }
+        findViewById<View>(R.id.auto_connect_pill_spinner)?.visibility =
+            if (title == StatusPillPolicy.Title.STEP) View.GONE else View.VISIBLE
+        return title
     }
 
     private fun hideAutoConnectPill() {
@@ -425,25 +595,221 @@ class MainActivity : BaseActivity() {
         pill.visibility = View.GONE
     }
 
-    private fun startAutoConnectWatchdog() {
-        autoConnectWatchdog?.cancel()
-        autoConnectWatchdog = lifecycleScope.launch {
-            delay(AUTO_CONNECT_WATCHDOG_MS)
-            if (autoConnectInProgress) {
-                AppLog.w("Auto-connect overlay: watchdog timeout, hiding")
-                endAutoConnect(success = false)
+    /**
+     * Drives the pill off [ConnectionStageTracker]: it is up whenever the connection stack is
+     * armed, not only during an auto-connect attempt, and its second line names the current step.
+     */
+    private fun observeConnectionStage() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                ConnectionStageTracker.stage.collect { renderStagePill(it) }
+            }
+        }
+        // It does not move the tracker, so the pill has to be asked again when it changes.
+        viewModel.homeShowsBringUp.observe(this) { renderStagePill(ConnectionStageTracker.stage.value) }
+        // Nor does a session going live or ending: the tracker can hold the same step across both.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                App.provide(this@MainActivity).commManager.connectionState.collect {
+                    renderStagePill(ConnectionStageTracker.stage.value)
+                }
+            }
+        }
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                ConnectionStageTracker.network.collect { renderNetworkLine(it) }
+            }
+        }
+        // The session coming up does not move the tracker, so the pill has to be asked again then.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                App.provide(this@MainActivity).commManager.connectionState.collect {
+                    renderStagePill(ConnectionStageTracker.stage.value)
+                }
             }
         }
     }
 
-    private fun showAutoConnectOverlay() {
-        // Watchdog is owned by this activity's lifecycleScope, so it must be
-        // (re)started here to survive configuration changes that recreate the
-        // activity while autoConnectInProgress remains true.
-        if (autoConnectWatchdog?.isActive != true) {
-            startAutoConnectWatchdog()
+    /** The pill's third line, logged like the step so a screenshot can be read against the log. */
+    private fun renderNetworkLine(detail: ConnectionNetworkDetail?) {
+        if (detail != renderedNetwork) {
+            renderedNetwork = detail
+            AppLog.i("MainActivity: status pill network: ${detail?.let { networkText(it) } ?: "none"}")
         }
+        applyNetworkText(detail, animate = true)
+    }
 
+    private fun networkText(detail: ConnectionNetworkDetail): String {
+        val line = ConnectionNetworkDetailPolicy.lineFor(detail)
+        return getString(line.id, *line.args.toTypedArray())
+    }
+
+    /** Sets the pill's third line. Not announced: the channel is not a step. */
+    private fun applyNetworkText(detail: ConnectionNetworkDetail?, animate: Boolean) {
+        val networkText = findViewById<TextView>(R.id.auto_connect_pill_network_text) ?: return
+        if (detail == null) {
+            networkText.animate().cancel()
+            networkText.visibility = View.GONE
+            return
+        }
+        val label = networkText(detail)
+        if (networkText.visibility == View.VISIBLE && networkText.text == label) return
+
+        networkText.animate().cancel()
+        if (!animate || networkText.visibility != View.VISIBLE) {
+            networkText.text = label
+            networkText.alpha = if (animate) 0f else STAGE_TEXT_ALPHA
+            networkText.visibility = View.VISIBLE
+            if (animate) networkText.animate().alpha(STAGE_TEXT_ALPHA).setDuration(STAGE_FADE_IN_MS).start()
+            return
+        }
+        networkText.animate().alpha(0f).setDuration(STAGE_FADE_OUT_MS).withEndAction {
+            networkText.text = label
+            networkText.animate().alpha(STAGE_TEXT_ALPHA).setDuration(STAGE_FADE_IN_MS).start()
+        }.start()
+    }
+
+    /**
+     * Applies the current stage to the pill. Called on every emission and again whenever an
+     * attempt ends, because the flow conflates a repeat of the value it already holds.
+     */
+    private fun renderStagePill(stage: ConnectionStage?) {
+        val now = SystemClock.elapsedRealtime()
+        val phoneLeftQuiet =
+            PhoneExitQuietPolicy.suppressesPill(ConnectionStageTracker.phoneLeftAtMs, now)
+        val homeTellsIt = viewModel.homeShowsBringUp.value == true
+        // PILL_THEN_OVERLAY hands the screen to the overlay part-way through an attempt.
+        // Re-raising the pill under it would undo that promotion. A live session keeps the tracker
+        // on its last step until it ends, and the home seen during one says so already.
+        val withheld = StatusPillPolicy.withheld(
+            stage = stage,
+            sessionLive = ProjectionWatchdogPolicy.isSessionLive(App.provide(this).commManager.connectionState.value),
+            overlayOwnsScreen = overlayOwnsScreen(),
+            phoneLeftQuiet = phoneLeftQuiet,
+            homeTellsIt = homeTellsIt,
+        )
+        val shown = StatusPillPolicy.shown(stage, withheld)
+        // What the user is actually being told, which no other line records. A reporter's
+        // screenshot and their log can then be read against each other. A step the overlay hides
+        // is still named: without that, a session where an auto-connect happened to be in flight
+        // and one where it did not leave different traces of the same bring-up.
+        if (stage != loggedStage || shown != renderedStage) {
+            loggedStage = stage
+            renderedStage = shown
+            val step = when {
+                shown != null -> shown.name
+                stage == null -> "hidden"
+                else -> "${stage.name} (not shown, " + when (withheld) {
+                    StatusPillPolicy.Withheld.SESSION_LIVE -> "the session is live"
+                    StatusPillPolicy.Withheld.PHONE_LEFT -> "the phone ended the session"
+                    StatusPillPolicy.Withheld.HOME_TELLS_IT -> "the home's main button tells it"
+                    else -> "the overlay owns the screen"
+                } + ")"
+            }
+            AppLog.i("MainActivity: status pill step: $step")
+        }
+        // Nothing emits at the end of the hold, so the step that was withheld needs asking for
+        // again; without this the pill stays down until the stack's next step.
+        phoneExitQuietJob?.cancel()
+        if (phoneLeftQuiet) {
+            val waitMs = PhoneExitQuietPolicy.remainingMs(ConnectionStageTracker.phoneLeftAtMs, now)
+            phoneExitQuietJob = lifecycleScope.launch {
+                delay(waitMs)
+                renderStagePill(ConnectionStageTracker.stage.value)
+            }
+        }
+        if (shown == null) {
+            hideAutoConnectPill()
+        } else {
+            showAutoConnectPill()
+            // Already the first line when the stack only waits, so not repeated under it.
+            val title = applyPillTitle(shown)
+            applyStageText(shown.takeIf { title != StatusPillPolicy.Title.STEP }, animate = true)
+        }
+    }
+
+    /**
+     * Sets the pill's second line. The crossfade doubles as cover for the pill resizing, which it
+     * does on every step because it wraps its content and the labels are translated.
+     */
+    private fun applyStageText(stage: ConnectionStage?, animate: Boolean) {
+        val stageText = findViewById<TextView>(R.id.auto_connect_pill_stage_text) ?: return
+        if (stage == null) {
+            stageText.animate().cancel()
+            stageText.visibility = View.GONE
+            return
+        }
+        val label = getString(stage.label)
+        if (stageText.visibility == View.VISIBLE && stageText.text == label) return
+
+        stageText.animate().cancel()
+        if (!animate) {
+            stageText.text = label
+            stageText.alpha = STAGE_TEXT_ALPHA
+            stageText.visibility = View.VISIBLE
+            return
+        }
+        // A discrete announcement per step, not an accessibilityLiveRegion: the pill is now
+        // permanently on screen, and a live region on one of those floods a screen reader.
+        findViewById<View>(R.id.auto_connect_pill)?.announceForAccessibility(label)
+        if (stageText.visibility != View.VISIBLE) {
+            stageText.text = label
+            stageText.alpha = 0f
+            stageText.visibility = View.VISIBLE
+            stageText.animate().alpha(STAGE_TEXT_ALPHA).setDuration(STAGE_FADE_IN_MS).start()
+            return
+        }
+        stageText.animate().alpha(0f).setDuration(STAGE_FADE_OUT_MS).withEndAction {
+            stageText.text = label
+            stageText.animate().alpha(STAGE_TEXT_ALPHA).setDuration(STAGE_FADE_IN_MS).start()
+        }.start()
+    }
+
+    /**
+     * Arms the bound when nothing is watching it. The bound lives on the activity that armed it and
+     * that activity does not survive a rebuild, so whoever is alive re-arms what is left of it.
+     */
+    private fun ensureAutoConnectWatchdog(rearmed: Boolean) {
+        if (!autoConnectInProgress) return
+        if (autoConnectWatchdog?.isActive == true) return
+        startAutoConnectWatchdog(rearmed)
+    }
+
+    /** @param rearmed whether this activity inherited the attempt rather than starting it. */
+    private fun startAutoConnectWatchdog(rearmed: Boolean) {
+        autoConnectWatchdog?.cancel()
+        val deadline = autoConnectDeadlineElapsed
+        val left = AutoConnectAttemptPolicy.remainingMs(deadline, SystemClock.elapsedRealtime())
+        val inherited = if (rearmed) ", re-armed" else ""
+        AppLog.i(
+            "Auto-connect: this attempt gives up in ${left / 1000}s (mode=$autoConnectMode$inherited)"
+        )
+        autoConnectWatchdog = lifecycleScope.launch {
+            // delay() is a postDelayed on the uptime clock, which stops while the unit is
+            // suspended, so the deadline is re-read after each sleep rather than assumed spent.
+            var remaining = left
+            while (autoConnectInProgress && remaining > 0L) {
+                delay(remaining)
+                remaining = AutoConnectAttemptPolicy.remainingMs(
+                    deadline, SystemClock.elapsedRealtime()
+                )
+            }
+            endAutoConnectIfExpired()
+        }
+    }
+
+    /** Ends an attempt whose bound has passed, wherever that is first noticed. */
+    private fun endAutoConnectIfExpired() {
+        if (!autoConnectInProgress) return
+        if (!AutoConnectAttemptPolicy.hasExpired(
+                autoConnectDeadlineElapsed, SystemClock.elapsedRealtime()
+            )
+        ) return
+        AppLog.w("Auto-connect: nothing answered this attempt (mode=$autoConnectMode), ending it")
+        endAutoConnect(success = false)
+    }
+
+    private fun showAutoConnectOverlay() {
         val overlay = findViewById<View>(R.id.auto_connect_loading_overlay) ?: return
         if (overlay.visibility == View.VISIBLE) return
 
@@ -685,6 +1051,12 @@ class MainActivity : BaseActivity() {
         }
     }
 
+    fun dismissSplashImmediately() {
+        val overlay = findViewById<View>(R.id.splash_overlay) ?: return
+        overlay.animate().cancel()
+        overlay.visibility = View.GONE
+    }
+
     private fun setupWifiDirectInfo() {
         val tvInfo = findViewById<android.widget.TextView>(R.id.wifi_direct_info)
         val settings = Settings(this)
@@ -727,7 +1099,34 @@ class MainActivity : BaseActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (intent.action == Intent.ACTION_MAIN && intent.hasCategory(Intent.CATEGORY_HOME)) {
+            // Like any launcher, Home leaves whatever inner screen was open (USB list, network
+            // list, app drawer) for the home itself. The home then shows its first page.
+            returnToHomeRoot()
+            viewModel.homePressed.value = SystemClock.uptimeMillis()
+        }
         handleLaunchIntent(intent)
+    }
+
+    /**
+     * Pops the nav back stack down to the home. super.onNewIntent has already marked the fragment
+     * state as not saved, so the pop is legal here; the check only guards a host that changes that.
+     */
+    private fun returnToHomeRoot() {
+        val navHost = supportFragmentManager.findFragmentById(R.id.main_content)
+            as? androidx.navigation.fragment.NavHostFragment ?: return
+        val navController = navHost.navController
+        val current = navController.currentDestination?.id ?: return
+        if (current == R.id.homeFragment) return
+        if (supportFragmentManager.isStateSaved) {
+            AppLog.w("MainActivity: Home key on an inner screen with the fragment state saved, not popping")
+            return
+        }
+        if (navController.popBackStack(R.id.homeFragment, false)) {
+            AppLog.i("MainActivity: Home key, back to the home from ${runCatching { resources.getResourceEntryName(current) }.getOrDefault(current.toString())}")
+        } else {
+            AppLog.w("MainActivity: Home key, the home is not on the back stack")
+        }
     }
 
     /**
@@ -768,8 +1167,22 @@ class MainActivity : BaseActivity() {
         }
     }
 
+    private fun forceSelfModeLaunch() {
+        HomeFragment.forceSelfModeLaunch = true
+        val selfModeIntent = Intent(this, AapService::class.java).apply {
+            this.action = AapService.ACTION_START_SELF_MODE
+        }
+        ContextCompat.startForegroundService(this, selfModeIntent)
+    }
+
     private fun handleLaunchIntent(intent: Intent?) {
         if (intent == null) return
+
+        if (intent.getBooleanExtra(EXTRA_SHOW_DRIVER_SELECTOR, false)) {
+            AppLog.i("MainActivity: EXTRA_SHOW_DRIVER_SELECTOR received")
+            HomeFragment.requestDriverSelection = true
+            intent.removeExtra(EXTRA_SHOW_DRIVER_SELECTOR)
+        }
 
         val intentData = intent.data
         val intentAction = intent.action
@@ -787,11 +1200,33 @@ class MainActivity : BaseActivity() {
         if (intentAction == AapService.ACTION_START_SELF_MODE ||
            (intentData?.scheme == "headunit" && intentData.host == "selfmode")) {
             AppLog.i("MainActivity: Forced self-mode start requested")
-            HomeFragment.forceSelfModeLaunch = true
-            val selfModeIntent = Intent(this, AapService::class.java).apply {
-                this.action = AapService.ACTION_START_SELF_MODE
+            forceSelfModeLaunch()
+        }
+
+        if (intent.getStringExtra(EXTRA_LAUNCH_SOURCE) == LAUNCH_SOURCE_BLUETOOTH) {
+            // The service has already been told to arm wireless; this is the non-blocking pill
+            // while it does, and the Self Mode launch, which only an activity can start because
+            // HomeFragment owns the VPN consent and the projection needs a foreground window.
+            val commManager = App.provide(this).commManager
+            val settings = App.provide(this).settings
+            // The service refuses this arrival while the pill's X holds, and a pill with nothing
+            // behind it would otherwise sit there for the watchdog's full deadline.
+            if (!commManager.isConnected && AapService.instance?.wirelessCancelledByUser() != true) {
+                beginAutoConnect(LAUNCH_SOURCE_BLUETOOTH, ConnectionUiMode.PILL)
             }
-            ContextCompat.startForegroundService(this, selfModeIntent)
+            val launchesSelfMode = BtAutoStartRearmPolicy.launchesSelfMode(
+                selfSelected = settings.showsSelf(),
+                wirelessSelected = settings.showsWifi(),
+                mode = settings.wifiConnectionMode,
+                sessionUp = commManager.isConnected,
+                nativeAttemptInFlight = AapService.instance?.nativeAttemptInFlight()
+            )
+            if (launchesSelfMode) {
+                AppLog.i("MainActivity: Bluetooth auto-start: forcing a Self Mode launch")
+                forceSelfModeLaunch()
+            } else {
+                AppLog.i("MainActivity: Bluetooth auto-start: leaving Self Mode alone")
+            }
         }
 
         if (intent.action == Intent.ACTION_VIEW) {
@@ -802,11 +1237,12 @@ class MainActivity : BaseActivity() {
                     ContextCompat.startForegroundService(this, Intent(this, AapService::class.java).apply {
                         action = AapService.ACTION_CONNECT_SOCKET
                     })
-                    lifecycleScope.launch(Dispatchers.IO) { App.provide(this@MainActivity).commManager.connect(ip, 5277) }
+                    lifecycleScope.launch(Dispatchers.IO) { App.provide(this@MainActivity).commManager.connect(ip, 5277, ConnectionPriorityPolicy.Tier.USER) }
                 } else {
                     AppLog.i("Received connect intent without IP -> triggering last session auto-connect")
                     val autoIntent = Intent(this, AapService::class.java).apply {
                         action = AapService.ACTION_CHECK_USB
+                        putExtra(AapService.EXTRA_USER_REQUESTED, true)
                     }
                     ContextCompat.startForegroundService(this, autoIntent)
                 }
@@ -828,10 +1264,12 @@ class MainActivity : BaseActivity() {
     }
 
     private fun requestPermissions() {
+        if (hasRequestedPermissionsThisSession) return
         // Single source of truth: the same registry the wizard/Settings permissions screen use.
         val permissionsToRequest = AppPermissions.missingNormalPermissions(this)
 
         if (permissionsToRequest.isNotEmpty()) {
+            hasRequestedPermissionsThisSession = true
             AppLog.i("Requesting missing permissions: $permissionsToRequest")
             ActivityCompat.requestPermissions(
                 this,
@@ -843,14 +1281,28 @@ class MainActivity : BaseActivity() {
         }
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == permissionRequestCode) {
+            hasRequestedPermissionsThisSession = true
+            AppLog.i("MainActivity: Permissions request completed.")
+        }
+    }
+
     private fun setFullscreen() {
         val root = findViewById<View>(R.id.root)
         val appSettings = Settings(this)
         SystemUI.apply(window, root, appSettings.fullscreenMode)
+        SystemUI.keepLegacyBarsHidden(window, appSettings.fullscreenMode)
     }
 
     override fun onResume() {
         super.onResume()
+        SettingsActivity.onMainScreenResumed()
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? android.view.inputmethod.InputMethodManager
         window.peekDecorView()?.let { v ->
             imm?.hideSoftInputFromWindow(v.windowToken, 0)
@@ -864,14 +1316,35 @@ class MainActivity : BaseActivity() {
         ContextCompat.registerReceiver(this, orientationReceiver, android.content.IntentFilter(AapService.ACTION_ORIENTATION_CHANGED), ContextCompat.RECEIVER_NOT_EXPORTED)
         isOrientationReceiverRegistered = true
 
-        // If an Android Auto session is active, bring the projection activity to front
-        if (App.provide(this).commManager.isConnected && !App.isPiPActive && !AapProjectionActivity.isForeground) {
+        // If an Android Auto session is active, bring the projection activity to front. As the
+        // unit's launcher the home is the base screen and the session keeps running behind it, so
+        // there the projection is opened from the main button. Without this, moving the projection
+        // to the background looked like it restarted the session two seconds later.
+        if (App.provide(this).commManager.isConnected && !App.isPiPActive &&
+            !AapProjectionActivity.isForeground && !CarLauncherManager.isDefaultLauncher(this)
+        ) {
             AppLog.i("MainActivity: Active session detected, bringing projection to front")
             bringProjectionToFront()
         }
 
+        // Every coroutine bound dies with the activity that owned it, and a resume is the one
+        // thing a recreated one always does, so the deadline is read here and re-armed here.
+        endAutoConnectIfExpired()
+        ensureAutoConnectWatchdog(rearmed = true)
+
         // Coming back from a failed attempt lands here, so this is where the reason gets said.
         updateConnectionIssueBanner()
+
+        checkOverlayPermission()
+    }
+
+    private fun checkOverlayPermission() {
+        val settings = App.provide(this).settings
+        if (settings.enableFloatingButton && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (!android.provider.Settings.canDrawOverlays(this)) {
+                FloatingButtonManager.requestOverlayPermission(this)
+            }
+        }
     }
 
     /**
@@ -888,6 +1361,10 @@ class MainActivity : BaseActivity() {
     /** The condition the banner is currently reporting, so the log line is not repeated. */
     private var loggedBannerIssue: ConnectionIssue? = null
 
+    /** Whether the connection issue banner is on screen, so the home holds its own hints back. */
+    fun connectionIssueBannerShown(): Boolean =
+        findViewById<View>(R.id.connection_issue_banner)?.visibility == View.VISIBLE
+
     private fun updateConnectionIssueBanner() {
         val banner = findViewById<View>(R.id.connection_issue_banner) ?: return
         val text = findViewById<android.widget.TextView>(R.id.connection_issue_text)
@@ -903,12 +1380,14 @@ class MainActivity : BaseActivity() {
                     settings.onboardingVersion >= OnboardingActivity.CURRENT_ONBOARDING_VERSION,
                 relevant = ConnectionIssueBannerPolicy.relevantNow(
                     mode = settings.wifiConnectionMode.id,
-                    transport = settings.nativeApStrategy
+                    transport = settings.nativeApStrategy,
+                    wirelessSelected = settings.showsWifi()
                 ),
                 remedyApplied = ConnectionIssueBannerPolicy.remedyApplied(
                     hotspotSsid = settings.hotspotSsid,
                     hotspotPassword = settings.hotspotPassword,
-                    staticBssid = settings.staticBSSID
+                    staticBssid = settings.staticBSSID,
+                    staticP2pBssid = settings.staticP2pBSSID
                 )
             )
         } catch (e: Exception) {
@@ -928,6 +1407,30 @@ class MainActivity : BaseActivity() {
                 ConnectionIssue.BSSID_UNAVAILABLE -> R.string.connection_issue_banner_bssid
                 ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE -> R.string.connection_issue_banner_hotspot_config
                 ConnectionIssue.HOTSPOT_NOT_RUNNING -> R.string.connection_issue_banner_hotspot_off
+                ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED ->
+                    R.string.connection_issue_banner_wifi_direct_refused
+                ConnectionIssue.WIFI_DIRECT_STACK_CYCLED ->
+                    R.string.connection_issue_banner_wifi_direct_cycled
+                ConnectionIssue.WIFI_DIRECT_STACK_STUCK ->
+                    R.string.connection_issue_banner_wifi_direct_stuck
+                ConnectionIssue.WIFI_RADIO_OFF ->
+                    R.string.connection_issue_banner_wifi_radio_off
+                ConnectionIssue.VIDEO_LINK_TOO_SLOW ->
+                    R.string.connection_issue_banner_video_link_too_slow
+                ConnectionIssue.FIVE_GHZ_CHANNEL_REFUSED ->
+                    R.string.connection_issue_banner_five_ghz_channel_refused
+                ConnectionIssue.HEADUNIT_SERVER_NOT_ANSWERING ->
+                    R.string.connection_issue_banner_headunit_server_deaf
+                ConnectionIssue.HANDS_FREE_HELD_ELSEWHERE ->
+                    R.string.connection_issue_banner_hands_free_held
+                ConnectionIssue.HANDS_FREE_RECORD_REFUSED ->
+                    R.string.connection_issue_banner_hands_free_record_refused
+                ConnectionIssue.PHONE_HOLDS_STALE_ENDPOINT ->
+                    R.string.connection_issue_banner_stale_endpoint
+                ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP ->
+                    R.string.connection_issue_banner_home_wifi_rejoined
+                ConnectionIssue.STALE_USB_ACCESSORY ->
+                    R.string.connection_issue_banner_stale_usb_accessory
             }
         )
         banner.setOnClickListener { openRemedyFor(issue) }
@@ -947,12 +1450,40 @@ class MainActivity : BaseActivity() {
     }
 
     /**
+     * The stuck-stack banner's action. Restarts WiFi itself when it can; otherwise opens the system
+     * WiFi panel, where switching WiFi off and on is two taps.
+     */
+    private fun restartWifiFromBanner() {
+        lifecycleScope.launch {
+            val route = WifiStackRecovery.availableRoute()
+            if (route == OemAppManager.ExecutionBackend.NONE && !Settings(this@MainActivity).wifiRestartRootGranted) {
+                openWifiPanel()
+                return@launch
+            }
+            ToastUtils.showToast(this@MainActivity, R.string.wifi_restart_running, Toast.LENGTH_SHORT, force = true)
+            val (ok, _) = WifiStackRecovery.restartWifi(applicationContext, "banner tap")
+            if (!ok) {
+                ToastUtils.showToast(this@MainActivity, R.string.wifi_restart_failed, Toast.LENGTH_LONG, force = true)
+                openWifiPanel()
+            }
+        }
+    }
+
+    private fun openWifiPanel() {
+        try {
+            startActivity(WifiStackRecovery.wifiPanelIntent())
+        } catch (e: Exception) {
+            AppLog.w("MainActivity: could not open the WiFi panel: ${e.message}")
+        }
+    }
+
+    /**
      * Open Settings on the row that fixes [issue].
      *
-     * Seeds the search box rather than using EXTRA_DESTINATION, which targets a whole screen: all
-     * three remedies are rows inside the settings list, and search is the only thing that reaches
-     * them regardless of the Basic/Advanced tier. Static BSSID is Advanced-only, so a Basic-mode
-     * user sent to Settings without this would not find the row the banner just named.
+     * Seeds the search box rather than using EXTRA_DESTINATION, which targets a whole screen: every
+     * remedy is a row inside the settings list, and search is the only thing that reaches them
+     * regardless of the Basic/Advanced tier. Static BSSID is Advanced-only, so a Basic-mode user
+     * sent to Settings without this would not find the row the banner just named.
      *
      * The hotspot query is a phrase carried in both override rows' search keywords rather than
      * either row's title, because that condition needs *both* of them: with a manual name set the
@@ -962,11 +1493,40 @@ class MainActivity : BaseActivity() {
      */
     private fun openRemedyFor(issue: ConnectionIssue) {
         val query = when (issue) {
+            // The remedy is on the phone, so there is no row here to send anyone to.
+            ConnectionIssue.HEADUNIT_SERVER_NOT_ANSWERING -> return
+            // The remedy is the cable.
+            ConnectionIssue.STALE_USB_ACCESSORY -> return
+            // The remedy is the other device's Bluetooth connection, which no setting here reaches.
+            ConnectionIssue.HANDS_FREE_HELD_ELSEWHERE -> return
+            // This unit's own Bluetooth stack refused the record. No row here changes its answer.
+            ConnectionIssue.HANDS_FREE_RECORD_REFUSED -> return
+            // The remedy is on the phone, and this unit is already applying the one it has.
+            ConnectionIssue.PHONE_HOLDS_STALE_ENDPOINT -> return
+            // The remedy is a WiFi restart: done here when root or local ADB allows, else the panel.
+            ConnectionIssue.WIFI_DIRECT_STACK_STUCK -> {
+                restartWifiFromBanner()
+                return
+            }
+            // Auto-reconnect is a per-network switch in Android's own WiFi settings.
+            ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP -> {
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_WIFI_SETTINGS))
+                } catch (e: Exception) {
+                    AppLog.w("MainActivity: could not open the WiFi settings: ${e.message}")
+                }
+                return
+            }
             ConnectionIssue.BLUETOOTH_SENT_NO_DATA -> getString(R.string.wireless_mode)
             ConnectionIssue.BSSID_UNAVAILABLE -> getString(R.string.static_bssid_title)
             ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE ->
                 getString(R.string.connection_issue_remedy_hotspot_query)
             ConnectionIssue.HOTSPOT_NOT_RUNNING -> getString(R.string.auto_enable_hotspot)
+            ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED -> getString(R.string.native_ap_transport)
+            ConnectionIssue.WIFI_DIRECT_STACK_CYCLED -> getString(R.string.native_ap_transport)
+            ConnectionIssue.WIFI_RADIO_OFF -> getString(R.string.native_ap_transport)
+            ConnectionIssue.VIDEO_LINK_TOO_SLOW -> getString(R.string.fps_limit)
+            ConnectionIssue.FIVE_GHZ_CHANNEL_REFUSED -> getString(R.string.wifi_direct_band)
         }
         startActivity(
             Intent(this, SettingsActivity::class.java)
@@ -1005,7 +1565,11 @@ class MainActivity : BaseActivity() {
         val wizardPending = appSettings.onboardingVersion < OnboardingActivity.CURRENT_ONBOARDING_VERSION
         if (wizardPending && !OnboardingActivity.deferredThisSession) {
             // The wizard's permissions step handles runtime permissions, so don't also prompt here.
-            startActivity(Intent(this, OnboardingActivity::class.java))
+            // The wizard has a task of its own (see the manifest), so a Home intent that clears
+            // this singleTask activity's task leaves it alive. NEW_TASK with the same plain intent
+            // brings that task back as it was, at the step and screen the user left, instead of
+            // starting a second wizard, however many times this runs.
+            startActivity(Intent(this, OnboardingActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         } else if (!wizardPending) {
             // Onboarding already completed (e.g. upgraders): request runtime permissions directly.
             requestPermissions()
@@ -1049,6 +1613,7 @@ class MainActivity : BaseActivity() {
         if (isFinishing) {
             AppLog.i("MainActivity finishing, resetting auto-start flag.")
             HomeFragment.resetAutoStart()
+            hasRequestedPermissionsThisSession = false
         }
     }
 
@@ -1063,20 +1628,19 @@ class MainActivity : BaseActivity() {
 
     companion object {
         private const val permissionRequestCode = 97
+        @Volatile var hasRequestedPermissionsThisSession: Boolean = false
         const val EXTRA_LAUNCH_SOURCE = "launch_source"
+        const val LAUNCH_SOURCE_BLUETOOTH = "Bluetooth auto-start"
+        const val EXTRA_SHOW_DRIVER_SELECTOR = "show_driver_selector"
 
         /** Launch sources that mean the app opened itself, with nobody necessarily watching. */
         private val AUTOMATIC_LAUNCH_SOURCES = setOf(
-            "Boot auto-start", "USB auto-start", "WiFi auto-start", "Bluetooth auto-start"
+            "Boot auto-start", "USB auto-start", "WiFi auto-start", LAUNCH_SOURCE_BLUETOOTH
         )
 
-        /**
-         * Hard upper bound for how long the auto-connect overlay may stay visible
-         * without the connection state advancing through the success path. Covers
-         * USB open hangs and silent AOA-mode-switch failures, which today produce
-         * no event for the observer to react to.
-         */
-        private const val AUTO_CONNECT_WATCHDOG_MS = 30_000L
+        private const val STAGE_TEXT_ALPHA = 0.8f
+        private const val STAGE_FADE_OUT_MS = 100L
+        private const val STAGE_FADE_IN_MS = 150L
 
         /**
          * `true` while the loading indicator should be (or is) covering the home
@@ -1093,6 +1657,22 @@ class MainActivity : BaseActivity() {
         @Volatile var autoConnectMode: ConnectionUiMode = ConnectionUiMode.OVERLAY
 
         /**
+         * When the in-progress attempt runs out, on the clock that keeps running while the unit
+         * sleeps. On the companion with the flag it bounds, so a recreated activity re-arms for
+         * the time that is left instead of starting the bound again or losing it.
+         */
+        @Volatile var autoConnectDeadlineElapsed: Long = 0L
+
+        /**
+         * Whether the full-screen overlay is up, which is the only auto-connect UI that takes the
+         * screen. The pill is not: it is up whenever the stack is armed, so treating it as busy
+         * suppresses anything that waits for a free screen for as long as the app runs.
+         */
+        @JvmStatic
+        fun overlayOwnsScreen(): Boolean =
+            autoConnectInProgress && autoConnectMode == ConnectionUiMode.OVERLAY
+
+        /**
          * Optional override for the status text (e.g. "Connecting to Pixel 8…"
          * from the Nearby selector). When `null`, the default
          * `R.string.android_auto_starting` is used. Kept on the companion so
@@ -1100,6 +1680,9 @@ class MainActivity : BaseActivity() {
          * attempt.
          */
         @Volatile var autoConnectStatusText: String? = null
+
+        /** Whether [autoConnectStatusText] claims the phone is disconnected and being woken. */
+        @Volatile var autoConnectStatusIsWakeClaim: Boolean = false
 
         /**
          * Tracks whether the connection attempt has reached an active state

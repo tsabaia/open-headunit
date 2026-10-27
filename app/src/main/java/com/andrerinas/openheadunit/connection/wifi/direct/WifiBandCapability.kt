@@ -39,6 +39,30 @@ object WifiBandCapability {
         }
     }
 
+    /**
+     * Whether this platform can be asked about the band at all.
+     *
+     * Distinct from a null [supports5Ghz], which also means a WiFi service that refused on a unit
+     * that does have the call. Below API 21 neither signal exists: the radio cannot be asked and
+     * [sessionFrequencyMhz] reads 0, so a caller weighing the link has nothing to weigh.
+     */
+    fun bandUnreadable(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP
+
+    @Volatile private var liveGroupFrequencyMhz: Int = 0
+
+    /** The frequency the group this unit hosts came up on; 0 when there is none or it is unreadable. */
+    fun reportSessionFrequency(frequencyMhz: Int) {
+        liveGroupFrequencyMhz = frequencyMhz
+    }
+
+    /**
+     * The frequency the network this session runs on came up on, or 0 when nothing reported one.
+     *
+     * `WifiP2pGroup` carries it from API 29 only and the other transports never report one, so 0
+     * means unreadable and must never be taken for 2.4 GHz.
+     */
+    fun sessionFrequencyMhz(): Int = liveGroupFrequencyMhz
+
     /** How the answer reads in a log line a reporter pastes into an issue. */
     fun describe(supports5Ghz: Boolean?): String = when (supports5Ghz) {
         true -> "this unit's WiFi radio reports a 5 GHz band"

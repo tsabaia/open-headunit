@@ -1,5 +1,6 @@
 package com.andrerinas.openheadunit.main
 
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.hct.HctServiceObserver
 import android.app.AlertDialog
 import android.content.ActivityNotFoundException
 import android.content.Context
@@ -13,8 +14,21 @@ import android.text.InputType
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ArrayAdapter
 import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
+import android.content.ClipData
+import android.content.ClipboardManager
+import com.andrerinas.openheadunit.aap.protocol.messages.BluetoothAnnouncePolicy
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.zbt.ZbtDiscovery
+import com.andrerinas.openheadunit.utils.OemAppManager
+import com.andrerinas.openheadunit.utils.CarLauncherManager
+import com.andrerinas.openheadunit.utils.OnboardingLauncherPolicy
+import com.andrerinas.openheadunit.utils.UpdateChecker
+import com.andrerinas.openheadunit.utils.UpdateLinkPolicy
 import androidx.activity.OnBackPressedCallback
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -26,10 +40,22 @@ import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.R
 import com.andrerinas.openheadunit.aap.AapService
 import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.CredentialField
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.NativeAaWakeDamagePolicy
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.zbt.ZbtProbe
 import com.andrerinas.openheadunit.input.MediaKeyRoutingPolicy
+import com.andrerinas.openheadunit.connection.wifi.direct.ObservedP2pCredentials
+import com.andrerinas.openheadunit.connection.wifi.direct.P2pIdentityEdit
+import com.andrerinas.openheadunit.connection.wifi.direct.P2pIdentityEditPolicy
+import com.andrerinas.openheadunit.connection.wifi.direct.P2pIdentityRejection
+import com.andrerinas.openheadunit.connection.wifi.direct.P2pIdentityRotationPolicy
+import com.andrerinas.openheadunit.connection.wifi.direct.StoredP2pIdentity
 import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.NativeCredentialsPreflightPolicy
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.NativeDriverSelectionPolicy
 import com.andrerinas.openheadunit.aap.NativeTransport
+import com.andrerinas.openheadunit.connection.wifi.FiveGhzChannelPolicy
 import com.andrerinas.openheadunit.connection.wifi.direct.P2pBandPreference
+import com.andrerinas.openheadunit.connection.wifi.direct.StationStandDownPolicy
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.HotspotBandPreference
 import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.PreflightReport
 import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.SoftApBssidPolicy
 import com.andrerinas.openheadunit.decoder.audio.PlaybackFocusPolicy
@@ -37,32 +63,48 @@ import com.andrerinas.openheadunit.decoder.video.VideoFaultInjector
 import com.andrerinas.openheadunit.decoder.video.DeviceMemoryProfile
 import com.andrerinas.openheadunit.main.settings.SettingItem
 import com.andrerinas.openheadunit.main.settings.SettingsAdapter
+import com.andrerinas.openheadunit.main.settings.SettingsCategory
+import com.andrerinas.openheadunit.main.settings.SettingsFilterPolicy
+import com.andrerinas.openheadunit.main.settings.SettingsHeaderController
+import com.andrerinas.openheadunit.main.settings.SettingsLayoutPolicy
 import com.andrerinas.openheadunit.utils.AppLog
 import com.andrerinas.openheadunit.utils.AppPermissions
 import com.andrerinas.openheadunit.utils.AppThemeManager
 import com.andrerinas.openheadunit.utils.Settings
+import com.andrerinas.openheadunit.view.PerformanceOverlayField
+import com.andrerinas.openheadunit.view.PerformanceOverlayPolicy
 import com.andrerinas.openheadunit.utils.LocaleHelper
 import com.andrerinas.openheadunit.BuildConfig
 import com.andrerinas.openheadunit.utils.LogExporter
 import com.andrerinas.openheadunit.utils.SettingsBackupManager
+import com.andrerinas.openheadunit.utils.ToastUtils
 import com.andrerinas.openheadunit.utils.VpnControl
 import com.andrerinas.openheadunit.utils.DialogUtils
-import com.google.android.material.appbar.MaterialToolbar
+import com.andrerinas.openheadunit.utils.ProjectionSetupQrDialog
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import androidx.activity.result.contract.ActivityResultContracts
 import android.content.pm.PackageManager
 import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.NativeAaHandshakeManager
+import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.ExternalBtTransportPolicy
 import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.NativeCredentialsPreflight
 import com.andrerinas.openheadunit.utils.BluetoothHelper
 import androidx.lifecycle.lifecycleScope
+import com.andrerinas.openheadunit.utils.WifiStackRecovery
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import com.andrerinas.openheadunit.connection.wifi.modes.helper.HelperStrategy
 import com.andrerinas.openheadunit.connection.wifi.modes.nativeaa.NativeStrategy
 import com.andrerinas.openheadunit.connection.wifi.WifiLauncherMode
+import com.andrerinas.openheadunit.connection.wifi.WirelessRearmPolicy
 import java.io.File
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -73,13 +115,10 @@ class SettingsFragment : Fragment() {
     private var preflightJob: Job? = null
     private lateinit var settingsRecyclerView: RecyclerView
     private lateinit var settingsAdapter: SettingsAdapter
-    private lateinit var toolbar: MaterialToolbar
-    private var saveButton: MaterialButton? = null
-    private var resetButton: MaterialButton? = null
+    // Back, title, Basic/Advanced, search, reset, save and the category rail or chips.
+    private var header: SettingsHeaderController? = null
 
-    // Basic/Advanced tab + search state (Feature A)
-    private var settingsTabGroup: com.google.android.material.button.MaterialButtonToggleGroup? = null
-    private var searchInput: com.google.android.material.textfield.TextInputEditText? = null
+    // Search state; the tab state is saved at once in settings.isAdvancedSettingsActive.
     private var searchQuery: String = ""
     // The complete, unfiltered list built by updateSettingsList(); rendering filters this.
     private var fullSettingsList: List<SettingItem> = emptyList()
@@ -88,7 +127,7 @@ class SettingsFragment : Fragment() {
     // Wireless items here only appear in Basic when the user connects wirelessly (see filterSettings).
     private val basicSettingIds = setOf(
         // General
-        "autoOptimize", "connectionMode", "appLanguage", "uiScale",
+        "autoOptimize", "connectionMode", "appLanguage",
         // Wireless (shown in Basic only when WiFi is among the selected connection modes).
         // The hotspot entries come along with the transport choice: they only render once Hotspot
         // is picked, and on a device that will not let an app read its hotspot configuration the
@@ -99,12 +138,17 @@ class SettingsFragment : Fragment() {
         // thing to try when a wireless session connects and shows no picture, and a user sent to
         // Advanced to find it is a user who never finds it.
         "wifiDirectBand", "wifiDirectBandHint",
+        // And the channel within the band, which is the same kind of first thing to try: a
+        // network on a channel the phone's regulatory domain forbids is one it never lists.
+        "fiveGhzChannel",
         "hotspotSsidOverride", "hotspotPasswordOverride",
+        // "What is my head unit's WiFi password" is an everyday question, not an Advanced one.
+        "wifiDirectLastNetwork", "wifiDirectGroupIdentity",
         "hotspotInterfaceOverride",
         // Dark mode
         "darkModeSettings",
         // Automation
-        "autoStartSettings", "autoConnectSettings",
+        "autoStartSettings", "autoConnectSettings", "enableCarLauncher",
         // Navigation
         "gpsNavigation",
         // Graphic
@@ -116,96 +160,139 @@ class SettingsFragment : Fragment() {
         // Input
         "keymap",
         // Audio
-        "enableAudioSink", "audioStreamSettings", "micSettings", "audioVolumeOffsets",
+        "enableAudioSink", "audioStreamSettings", "audioMatchingMode", "audioMatchingModeHint", "useAAudioOutput", "micSettings", "audioVolumeOffsets",
         // Info
         "version", "about", "support"
     )
 
     // Local state to hold changes before saving
-    private var pendingAdvancedSettings: Boolean? = null
-    private var pendingUseGps: Boolean? = null
-    private var pendingShowNavigationNotifications: Boolean? = null
-    private var pendingSyncMediaSessionAaMetadata: Boolean? = null
-    private var pendingResolution: Int? = null
-    private var pendingDpi: Int? = null
-    private var pendingPixelAspectRatioE4: Int? = null
-    private var pendingStaticBSSID: String? = null
-    private var pendingFullscreenMode: Settings.FullscreenMode? = null
-    private var pendingViewMode: Settings.ViewMode? = null
-    private var pendingForceSoftware: Boolean? = null
-    private var pendingSoftwareVideoDecoder: Settings.SoftwareVideoDecoder? = null
-    private var pendingVideoCodec: String? = null
-    private var pendingFpsLimit: Int? = null
-    private var pendingBluetoothAddress: String? = null
-    private var pendingEnableAudioSink: Boolean? = null
-    private var pendingStaticAudioFocus: Boolean? = null
-    private var pendingPlaybackFocusMode: PlaybackFocusPolicy.Mode? = null
-    private var pendingUseAacAudio: Boolean? = null
-    private var pendingAttachHwDspEqualizer: Boolean? = null
-    private var pendingMicInputSource: Int? = null
-    private var pendingEnableRotary: Boolean? = null
-    private var pendingMediaKeyRouting: MediaKeyRoutingPolicy.Mode? = null
-    private var pendingAudioLatencyMultiplier: Int? = null
-    private var pendingUseLibusb: Boolean? = null
-    private var pendingAudioQueueCapacity: Int? = null
-    private var pendingShowFpsCounter: Boolean? = null
-    private var pendingShowToastMessages: Boolean? = null
-    private var pendingScreenOrientation: Settings.ScreenOrientation? = null
-    private var pendingAppLanguage: String? = null
-    private var pendingFakeSpeed: Boolean? = null
+    private val pending = SettingsPendingCopy()
+    private var pendingUseGps by pending::useGps
+    private var pendingShowNavigationNotifications by pending::showNavigationNotifications
+    private var pendingSyncMediaSessionAaMetadata by pending::syncMediaSessionAaMetadata
+    private var pendingAutoResumePlaybackOnReconnect by pending::autoResumePlaybackOnReconnect
+    private var pendingResolution by pending::resolution
+    private var pendingDpi by pending::dpi
+    private var pendingPixelAspectRatioE4 by pending::pixelAspectRatioE4
+    private var pendingStaticBSSID by pending::staticBSSID
+    private var pendingStaticP2pBSSID by pending::staticP2pBSSID
+    private var pendingFullscreenMode by pending::fullscreenMode
+    private var pendingViewMode by pending::viewMode
+    private var pendingForceSoftware by pending::forceSoftware
+    private var pendingSoftwareVideoDecoder by pending::softwareVideoDecoder
+    private var pendingVideoCodec by pending::videoCodec
+    private var pendingFpsLimit by pending::fpsLimit
+    private var pendingBluetoothAddress by pending::bluetoothAddress
+    private var pendingBluetoothAnnounceSkip by pending::bluetoothAnnounceSkip
+    private var pendingEnableAudioSink by pending::enableAudioSink
+    private var pendingStaticAudioFocus by pending::staticAudioFocus
+    private var pendingPlaybackFocusMode by pending::playbackFocusMode
+    private var pendingUseAacAudio by pending::useAacAudio
+    private var pendingUseAAudioOutput by pending::useAAudioOutput
+    private var pendingAttachHwDspEqualizer by pending::attachHwDspEqualizer
+    private var pendingMicInputSource by pending::micInputSource
+    private var pendingEnableRotary by pending::enableRotary
+    private var pendingMediaKeyRouting by pending::mediaKeyRouting
+    private var pendingAudioLatencyMultiplier by pending::audioLatencyMultiplier
+    private var pendingAudioTimeCorrectionMode by pending::audioMatchingMode
+    private var pendingUseLibusb by pending::useLibusb
+    private var pendingAudioQueueCapacity by pending::audioQueueCapacity
+    private var pendingShowToastMessages by pending::showToastMessages
+    private var pendingScreenOrientation by pending::screenOrientation
+    private var pendingAppLanguage by pending::appLanguage
+    private var pendingFakeSpeed by pending::fakeSpeed
+    private var pendingAutoRestartWifi by pending::autoRestartWifi
+    private var pendingNarrowBandProfileCap by pending::narrowBandProfileCap
+    private var pendingDebugVideoLowLatency by pending::debugVideoLowLatency
+    private var pendingAllowExternalConfiguration by pending::allowExternalConfiguration
+    private var pendingKeepDummyVpnDuringSession by pending::keepDummyVpnDuringSession
 
-    private var pendingWifiConnectionMode: WifiLauncherMode? = null
-    private var pendingHelperConnectionStrategy: HelperStrategy? = null
-    private var pendingAutoEnableHotspot: Boolean? = null
-    private var pendingWaitForWifi: Boolean? = null
-    private var pendingWaitForWifiTimeout: Int? = null
-    private var pendingBluetoothManagerServiceName: String? = null
-    private var pendingManualSecondaryBluetoothServiceName: String? = null
-    private var pendingNativeWifiVersionExchange: Boolean? = null
-    private var pendingNativeApTransport: NativeStrategy? = null
-    private var pendingWifiDirectBand: Int? = null
-    private var pendingHotspotBand: Int? = null
-    private var pendingHotspotSsid: String? = null
-    private var pendingHotspotPassword: String? = null
-    private var pendingHotspotInterface: String? = null
+    private var pendingWifiConnectionMode by pending::wifiConnectionMode
+    private var pendingHelperConnectionStrategy by pending::helperConnectionStrategy
+    private var pendingAutoEnableHotspot by pending::autoEnableHotspot
+    private var pendingWaitForWifi by pending::waitForWifi
+    private var pendingWaitForWifiTimeout by pending::waitForWifiTimeout
+    private var pendingBluetoothManagerServiceName by pending::bluetoothManagerServiceName
+    private var pendingNativeAaIgnoreExternalBt by pending::nativeAaIgnoreExternalBt
+    private var pendingExternalBtZbtTransport by pending::externalBtZbtTransport
+    private var pendingExternalBtBlinkTransport by pending::externalBtBlinkTransport
 
-    // Flag to determine if the projection should stretch to fill the screen
-    private var pendingStretchToFill: Boolean? = null
-    private var pendingForcedScale: Boolean? = null
-    private var pendingHudMirroring: Boolean? = null
-    private var pendingUseMeasuredTouchSurface: Boolean? = null
+    // The probe's verdict is not a pending setting: it changes nothing and there is nothing to
+    // save. It lives in the companion object with the job that produces it. This one is
+    // per-view, because it is the thing that repaints the row.
+    private var zbtProbeFollowJob: Job? = null
+    /** Resolves which external-BT route the Native AA dialog should describe. Cancelled on exit. */
+    private var externalBtRouteJob: Job? = null
+    private var pendingNativeApTransport by pending::nativeApTransport
+    private var pendingNativeDriverSelectionMode by pending::nativeDriverSelectionMode
+    private var pendingNativeDriverSelectionTimeout by pending::nativeDriverSelectionTimeout
+    private var pendingNativePreferredDeviceMac by pending::nativePreferredDeviceMac
+    private var pendingWifiDirectBand by pending::wifiDirectBand
+    private var pendingWifiDirectStableIdentity by pending::wifiDirectStableIdentity
+    // The pair and its provenance move together; null on the second means neither was edited,
+    // which is the only way null on the first can mean "back to a pair the app draws".
+    private var pendingWifiDirectGroupIdentity by pending::wifiDirectGroupIdentity
+    private var pendingWifiDirectIdentityUserSet by pending::wifiDirectIdentityUserSet
+    private var pendingStationStandDownMode by pending::stationStandDownMode
+    private var pendingHotspotBand by pending::hotspotBand
+    private var pendingFiveGhzChannel by pending::fiveGhzChannel
+    private var pendingHotspotSsid by pending::hotspotSsid
+    private var pendingHotspotPassword by pending::hotspotPassword
+    private var pendingHotspotInterface by pending::hotspotInterface
 
-    private var pendingKillOnDisconnect: Boolean? = null
-    private var pendingRaiseProjectionDuringCall: Boolean? = null
+    private var pendingEnableCarLauncher by pending::enableCarLauncher
+    private var pendingEnableFloatingButton by pending::enableFloatingButton
+    private var pendingFloatingButtonConnectionStatusMode by pending::floatingButtonConnectionStatusMode
+    private var pendingFloatingButtonDisconnectedOpacityPercent by pending::floatingButtonDisconnectedOpacityPercent
+    private var pendingFloatingButtonSizeDp by pending::floatingButtonSizeDp
+    private var pendingFloatingButtonOpacityPercent by pending::floatingButtonOpacityPercent
+    private var pendingFloatingButtonXPercent by pending::floatingButtonXPercent
+    private var pendingFloatingButtonYPercent by pending::floatingButtonYPercent
+    private var pendingAaExitAction by pending::aaExitAction
+    private var pendingVideoFitMode by pending::videoFitMode
+    private var pendingForcedScale by pending::forcedScale
+    private var pendingHudMirroring by pending::hudMirroring
+
+    private var pendingKillOnDisconnect by pending::killOnDisconnect
+    private var pendingAutoKillOemApps by pending::autoKillOemApps
+    private var pendingRaiseProjectionDuringCall by pending::raiseProjectionDuringCall
 
     // Custom Insets
-    private var pendingInsetLeft: Int? = null
-    private var pendingInsetTop: Int? = null
-    private var pendingInsetRight: Int? = null
-    private var pendingInsetBottom: Int? = null
+    private var pendingInsetLeft by pending::insetLeft
+    private var pendingInsetTop by pending::insetTop
+    private var pendingInsetRight by pending::insetRight
+    private var pendingInsetBottom by pending::insetBottom
 
-    private var pendingUiScaleHomePercent: Int? = null
-    private var pendingUiScaleSettingsPercent: Int? = null
 
-    private var pendingMediaVolumeOffset: Int? = null
-    private var pendingGuidanceVolumeOffset: Int? = null
-    private var pendingSystemVolumeOffset: Int? = null
 
-    private var pendingHideBatteryLevel: Boolean? = null
-    private var pendingHidePhoneSignal: Boolean? = null
-    private var pendingHideClock: Boolean? = null
+    private var pendingMediaVolumeOffset by pending::mediaVolumeOffset
+    private var pendingGuidanceVolumeOffset by pending::guidanceVolumeOffset
+    private var pendingSystemVolumeOffset by pending::systemVolumeOffset
+
+    private var pendingHideBatteryLevel by pending::hideBatteryLevel
+    private var pendingHidePhoneSignal by pending::hidePhoneSignal
+    private var pendingHideClock by pending::hideClock
 
     private var requiresRestart = false
+    private var requiresServiceRestart = false
     private var hasChanges = false
-    private val SAVE_ITEM_ID = 1001
-    private val RESET_ITEM_ID = 1002
     private var pendingStorageAction: (() -> Unit)? = null
+
+    // The preferred-phone row lists paired devices, which needs BLUETOOTH_CONNECT on API 31+.
+    private val preferredDevicePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+        if (isGranted) {
+            updateSettingsList()
+            showPreferredDevicePicker()
+        } else {
+            ToastUtils.showToast(requireContext(), R.string.bt_permission_denied, Toast.LENGTH_LONG, force = true)
+        }
+    }
 
     private val bluetoothPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
         if (isGranted) {
             handleNativeAaSelection()
         } else {
-            Toast.makeText(requireContext(), R.string.bt_permission_denied, Toast.LENGTH_LONG).show()
+            ToastUtils.showToast(requireContext(), R.string.bt_permission_denied, Toast.LENGTH_LONG, force = true)
         }
     }
 
@@ -213,14 +300,22 @@ class SettingsFragment : Fragment() {
     // afterwards, so this dialog is the one moment a Fragment has to be involved. AapService can
     // start the VPN with no Activity once this has run. On the Play Store flavor the toggle that
     // launches this is never rendered, because VpnControl.isVpnAvailable() is false there.
-    private var pendingKeepDummyVpn = false
+    private var vpnConsentRequested = false
     private val vpnConsentLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val granted = result.resultCode == android.app.Activity.RESULT_OK
-        settings.keepDummyVpnDuringSession = granted && pendingKeepDummyVpn
-        pendingKeepDummyVpn = false
-        if (!granted && VpnControl.consentDeniedRes != 0) {
-            Toast.makeText(requireContext(), VpnControl.consentDeniedRes, Toast.LENGTH_LONG).show()
+        if (vpnConsentRequested) {
+            pendingKeepDummyVpnDuringSession = granted
+            checkChanges()
         }
+        vpnConsentRequested = false
+        if (!granted && VpnControl.consentDeniedRes != 0) {
+            ToastUtils.showToast(requireContext(), VpnControl.consentDeniedRes, Toast.LENGTH_LONG, force = true)
+        }
+        updateSettingsList()
+    }
+
+    private val homeRoleLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        CarLauncherManager.onRoleRequestResult(requireContext())
         updateSettingsList()
     }
 
@@ -230,7 +325,7 @@ class SettingsFragment : Fragment() {
         if (isGranted) {
             action?.invoke()
         } else {
-            Toast.makeText(requireContext(), R.string.storage_permission_denied_backup, Toast.LENGTH_LONG).show()
+            ToastUtils.showToast(requireContext(), R.string.storage_permission_denied_backup, Toast.LENGTH_LONG, force = true)
         }
     }
 
@@ -267,78 +362,14 @@ class SettingsFragment : Fragment() {
 
         settings = App.provide(requireContext()).settings
 
+        // Picking this app as home clears this screen before its Save, so a held role counts as on.
+        val held = CarLauncherManager.isDefaultLauncher(requireContext())
+        if (OnboardingLauncherPolicy.launcherModeOnOpen(settings.enableCarLauncher, held) != settings.enableCarLauncher) {
+            settings.enableCarLauncher = true
+            AppLog.i("SettingsFragment: the app holds the home role, storing car launcher mode")
+        }
         // Initialize local state with current values
-        pendingAdvancedSettings = settings.isAdvancedSettingsActive
-        pendingUseGps = settings.useGpsForNavigation
-        pendingShowNavigationNotifications = settings.showNavigationNotifications
-        pendingSyncMediaSessionAaMetadata = settings.syncMediaSessionWithAaMetadata
-        pendingResolution = settings.resolutionId
-        pendingDpi = settings.dpiPixelDensity
-        pendingPixelAspectRatioE4 = settings.pixelAspectRatioE4
-        pendingStaticBSSID = settings.staticBSSID
-        pendingFullscreenMode = settings.fullscreenMode
-        pendingViewMode = settings.viewMode
-        pendingForceSoftware = settings.forceSoftwareDecoding
-        pendingSoftwareVideoDecoder = settings.softwareVideoDecoder
-        pendingVideoCodec = settings.videoCodec
-        pendingFpsLimit = settings.fpsLimit
-        pendingBluetoothAddress = settings.bluetoothAddress
-        pendingEnableAudioSink = settings.enableAudioSink
-        pendingStaticAudioFocus = settings.staticAudioFocus
-        pendingPlaybackFocusMode = settings.playbackFocusMode
-        pendingUseAacAudio = settings.useAacAudio
-        pendingAttachHwDspEqualizer = settings.attachHwDspEqualizer
-        pendingMicInputSource = settings.micInputSource
-        pendingEnableRotary = settings.enableRotary
-        pendingMediaKeyRouting = settings.mediaKeyRouting
-        pendingAudioLatencyMultiplier = settings.audioLatencyMultiplier
-        pendingAudioQueueCapacity = settings.audioQueueCapacity
-        pendingShowFpsCounter = settings.showFpsCounter
-        pendingShowToastMessages = settings.showToastMessages
-        pendingScreenOrientation = settings.screenOrientation
-        pendingAppLanguage = settings.appLanguage
-
-        // Initialize local state for stretch to fill
-        pendingStretchToFill = settings.stretchToFill
-        pendingForcedScale = settings.forcedScale
-        pendingHudMirroring = settings.hudMirroring
-        pendingUseMeasuredTouchSurface = settings.useMeasuredTouchSurface
-
-        pendingKillOnDisconnect = settings.killOnDisconnect
-        pendingRaiseProjectionDuringCall = settings.raiseProjectionDuringCall
-        pendingAutoEnableHotspot = settings.autoEnableHotspot
-        pendingFakeSpeed = settings.fakeSpeed
-        pendingUseLibusb = settings.useLibusb
-
-        pendingWifiConnectionMode = settings.wifiConnectionMode
-        pendingHelperConnectionStrategy = settings.helperConnectionStrategy
-        pendingWaitForWifi = settings.waitForWifiBeforeWifiDirect
-        pendingWaitForWifiTimeout = settings.waitForWifiTimeout
-        pendingBluetoothManagerServiceName = settings.bluetoothManagerServiceName
-        pendingManualSecondaryBluetoothServiceName = settings.manualSecondaryBluetoothServiceName
-        pendingNativeWifiVersionExchange = settings.nativeWifiVersionExchange
-        pendingNativeApTransport = settings.nativeApStrategy
-        pendingWifiDirectBand = settings.wifiDirectBand
-        pendingHotspotBand = settings.hotspotBand
-        pendingHotspotSsid = settings.hotspotSsid
-        pendingHotspotPassword = settings.hotspotPassword
-        pendingHotspotInterface = settings.hotspotInterface
-
-        pendingInsetLeft = settings.insetLeft
-        pendingInsetTop = settings.insetTop
-        pendingInsetRight = settings.insetRight
-        pendingInsetBottom = settings.insetBottom
-        // UI Scale pending values (percent)
-        pendingUiScaleHomePercent = settings.uiScaleHomePercent
-        pendingUiScaleSettingsPercent = settings.uiScaleSettingsPercent
-
-        pendingMediaVolumeOffset = settings.mediaVolumeOffset
-        pendingGuidanceVolumeOffset = settings.guidanceVolumeOffset
-        pendingSystemVolumeOffset = settings.systemVolumeOffset
-
-        pendingHidePhoneSignal = settings.hidePhoneSignal
-        pendingHideBatteryLevel = settings.hideBatteryLevel
-        pendingHideClock = settings.hideClock
+        pending.loadFrom(settings)
 
         // Loading screen settings are handled in LoadingScreenFragment (saves directly)
 
@@ -349,29 +380,34 @@ class SettingsFragment : Fragment() {
             }
         })
 
-        toolbar = view.findViewById(R.id.toolbar)
         settingsAdapter = SettingsAdapter()
         settingsRecyclerView = view.findViewById(R.id.settingsRecyclerView)
         settingsRecyclerView.layoutManager = LinearLayoutManager(requireContext())
         settingsRecyclerView.adapter = settingsAdapter
 
-        setupTabsAndSearch(view)
-
-        // Receive the DPI chosen in the DPI sub-screen and feed it into the pending flow,
-        // so the main "Save (Reconnect needed)" applies it.
-        findNavController().currentBackStackEntry
-            ?.savedStateHandle
-            ?.getLiveData<Int>(DpiSettingsFragment.KEY_DPI_RESULT)
-            ?.observe(viewLifecycleOwner) { newDpi ->
-                if (newDpi != pendingDpi) {
-                    pendingDpi = newDpi
-                    checkChanges()
-                    updateSettingsList()
-                }
-            }
+        setupHeader(view)
 
         updateSettingsList()
-        setupToolbar()
+        if (Build.VERSION.SDK_INT >= 26) viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                launch {
+                    com.andrerinas.openheadunit.connection.wifi.scan.WifiScanControl.state.collect {
+                        updateSettingsList()
+                    }
+                }
+                // Service/permission and Wi-Fi changes can leave the idle controller state
+                // unchanged. Observe only while this screen is visible, without binding it.
+                var previous = wifiScanSummary()
+                while (isActive) {
+                    delay(1_000)
+                    val current = wifiScanSummary()
+                    if (current != previous) {
+                        previous = current
+                        updateSettingsList()
+                    }
+                }
+            }
+        }
 
         savedInstanceState?.getParcelable<android.os.Parcelable>("recycler_scroll")?.let {
             settingsRecyclerView.layoutManager?.onRestoreInstanceState(it)
@@ -388,99 +424,111 @@ class SettingsFragment : Fragment() {
     }
 
     private fun reloadPendingStateFromSettings() {
-        pendingAdvancedSettings = settings.isAdvancedSettingsActive
-        pendingUseGps = settings.useGpsForNavigation
-        pendingShowNavigationNotifications = settings.showNavigationNotifications
-        pendingSyncMediaSessionAaMetadata = settings.syncMediaSessionWithAaMetadata
-        pendingResolution = settings.resolutionId
-        pendingDpi = settings.dpiPixelDensity
-        pendingPixelAspectRatioE4 = settings.pixelAspectRatioE4
-        pendingFullscreenMode = settings.fullscreenMode
-        pendingViewMode = settings.viewMode
-        pendingForceSoftware = settings.forceSoftwareDecoding
-        pendingSoftwareVideoDecoder = settings.softwareVideoDecoder
-        pendingVideoCodec = settings.videoCodec
-        pendingFpsLimit = settings.fpsLimit
-        pendingBluetoothAddress = settings.bluetoothAddress
-        pendingEnableAudioSink = settings.enableAudioSink
-        pendingStaticAudioFocus = settings.staticAudioFocus
-        pendingPlaybackFocusMode = settings.playbackFocusMode
-        pendingUseAacAudio = settings.useAacAudio
-        pendingAttachHwDspEqualizer = settings.attachHwDspEqualizer
-        pendingEnableRotary = settings.enableRotary
-        pendingMediaKeyRouting = settings.mediaKeyRouting
-        pendingAudioLatencyMultiplier = settings.audioLatencyMultiplier
-        pendingAudioQueueCapacity = settings.audioQueueCapacity
-        pendingShowFpsCounter = settings.showFpsCounter
-        pendingShowToastMessages = settings.showToastMessages
-        pendingScreenOrientation = settings.screenOrientation
-        pendingAppLanguage = settings.appLanguage
-        pendingStretchToFill = settings.stretchToFill
-        pendingForcedScale = settings.forcedScale
-        pendingHudMirroring = settings.hudMirroring
-        pendingUseMeasuredTouchSurface = settings.useMeasuredTouchSurface
-        pendingKillOnDisconnect = settings.killOnDisconnect
-        pendingRaiseProjectionDuringCall = settings.raiseProjectionDuringCall
-        pendingAutoEnableHotspot = settings.autoEnableHotspot
-        pendingFakeSpeed = settings.fakeSpeed
-        pendingUseLibusb = settings.useLibusb
-        pendingWifiConnectionMode = settings.wifiConnectionMode
-        pendingHelperConnectionStrategy = settings.helperConnectionStrategy
-        pendingWaitForWifi = settings.waitForWifiBeforeWifiDirect
-        pendingWaitForWifiTimeout = settings.waitForWifiTimeout
-        pendingBluetoothManagerServiceName = settings.bluetoothManagerServiceName
-        pendingManualSecondaryBluetoothServiceName = settings.manualSecondaryBluetoothServiceName
-        pendingNativeWifiVersionExchange = settings.nativeWifiVersionExchange
-        pendingNativeApTransport = settings.nativeApStrategy
-        pendingWifiDirectBand = settings.wifiDirectBand
-        pendingHotspotBand = settings.hotspotBand
-        pendingHotspotSsid = settings.hotspotSsid
-        pendingHotspotPassword = settings.hotspotPassword
-        pendingHotspotInterface = settings.hotspotInterface
-        pendingInsetLeft = settings.insetLeft
-        pendingInsetTop = settings.insetTop
-        pendingInsetRight = settings.insetRight
-        pendingInsetBottom = settings.insetBottom
-        pendingUiScaleHomePercent = settings.uiScaleHomePercent
-        pendingUiScaleSettingsPercent = settings.uiScaleSettingsPercent
-        pendingMediaVolumeOffset = settings.mediaVolumeOffset
-        pendingGuidanceVolumeOffset = settings.guidanceVolumeOffset
-        pendingSystemVolumeOffset = settings.systemVolumeOffset
-        pendingHideBatteryLevel = settings.hideBatteryLevel
-        pendingHidePhoneSignal = settings.hidePhoneSignal
-        pendingHideClock = settings.hideClock
+        pending.loadFrom(settings)
+        CarLauncherManager.syncWithSettings(requireContext(), settings.enableCarLauncher)
     }
 
-    private fun setupToolbar() {
-        toolbar.setNavigationOnClickListener {
-            handleBackPress()
+    /**
+     * Explain what the probe does, then run it off the main thread if the user agrees.
+     *
+     * Both modes open the vendor channel and send RequestInit, which may activate Android Auto
+     * handling on the module. Watch-only skips the additional reconnect command; confirmation
+     * keeps this diagnostic separate from automatic route selection.
+     */
+    private fun confirmAndRunZbtProbe() {
+        // Same builder and theme as every other dialog here. A bare AlertDialog.Builder came up
+        // unthemed on a 1024x600 unit with no reachable button, and two rounds were spent on a probe
+        // that never ran. The message stays short for the same reason: a taller one pushes the
+        // button bar off a 600-pixel screen.
+        MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+            .setTitle(R.string.zbt_probe_title)
+            .setMessage(R.string.zbt_probe_message)
+            .setNegativeButton(android.R.string.cancel, null)
+            .setNeutralButton(R.string.zbt_probe_watch_only) { _, _ ->
+                startZbtProbe(askModuleToReconnect = false)
+            }
+            .setPositiveButton(R.string.zbt_probe_wake_and_watch) { _, _ ->
+                startZbtProbe(askModuleToReconnect = true)
+            }
+            .show()
+    }
+
+    /**
+     * Start the probe, unless one is already running, and follow it on screen while it does.
+     *
+     * The work and the UI refresh are on deliberately different scopes. The probe outlives this
+     * screen (see the companion object); the refresh must not, so it is a view-scoped loop that
+     * reads the shared verdict and stops when the run does.
+     */
+    private fun startZbtProbe(askModuleToReconnect: Boolean) {
+        if (zbtProbeJob?.isActive != true) {
+            zbtProbeResult = getString(R.string.zbt_probe_running)
+            zbtProbeJob = zbtProbeScope.launch {
+                val verdict = try {
+                    // The row shows every stage because the run lasts about two minutes. A probe
+                    // showing one unchanging word for that long reads as hung.
+                    ZbtProbe.run(
+                        askModuleToReconnect = askModuleToReconnect,
+                        onProgress = { text -> zbtProbeResult = text },
+                        keepGoing = { isActive }
+                    )
+                } catch (e: Throwable) {
+                    // Never let a probe take the settings screen down with it.
+                    AppLog.e("SettingsFragment: external Bluetooth probe failed", e)
+                    "Probe failed: ${e.javaClass.simpleName}"
+                }
+                zbtProbeResult = verdict
+            }
+        }
+        followZbtProbe()
+    }
+
+    /** Repaint the probe's row until the run ends. Cheap, and only alive while the view is. */
+    private fun followZbtProbe() {
+        if (zbtProbeFollowJob?.isActive == true) return
+        zbtProbeFollowJob = viewLifecycleOwner.lifecycleScope.launch {
+            do {
+                updateSettingsList()
+                delay(500)
+            } while (zbtProbeJob?.isActive == true)
+            updateSettingsList()
+        }
+    }
+
+    /** The phone Native AA prefers when several are paired. Needs BLUETOOTH_CONNECT on API 31+. */
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun showPreferredDevicePicker() {
+        val currentPrefMac = pendingNativePreferredDeviceMac.orEmpty()
+        val bonded = BluetoothHelper.pairedDevicesOrEmpty(requireContext())
+        // Only a phone can be the preferred phone: a watch chosen here used to
+        // count as one everywhere. A stored non-phone is cleared with None.
+        val likelyPhones = bonded.filter {
+            BluetoothHelper.isLikelyPhone(it, preferredMac = currentPrefMac)
         }
 
-        val resetItem = toolbar.menu.add(0, RESET_ITEM_ID, 0, getString(R.string.reset_settings))
-        resetItem.setShowAsAction(android.view.MenuItem.SHOW_AS_ACTION_ALWAYS)
-        resetItem.setActionView(R.layout.layout_reset_button)
-
-        resetButton = resetItem.actionView?.findViewById(R.id.reset_button_widget)
-        resetButton?.contentDescription = getString(R.string.reset_settings)
-        resetButton?.setOnClickListener {
-            startResetSettings()
+        val options = mutableListOf<Pair<String, String>>()
+        options.add("" to getString(R.string.driver_none))
+        for (dev in likelyPhones) {
+            val name = dev.name ?: "Unknown"
+            options.add(dev.address to "$name (${dev.address})")
         }
+        val labels = options.map { it.second }.toTypedArray()
+        val selectedIdx = options.indexOfFirst { it.first.equals(currentPrefMac, ignoreCase = true) }.coerceAtLeast(0)
 
-        // Add the Save item with custom layout
-        val saveItem = toolbar.menu.add(0, SAVE_ITEM_ID, 1, getString(R.string.save))
-        saveItem.setShowAsAction(android.view.MenuItem.SHOW_AS_ACTION_ALWAYS)
-        saveItem.setActionView(R.layout.layout_save_button)
-
-        // Get the button from the action view
-        saveButton = saveItem.actionView?.findViewById(R.id.save_button_widget)
-        saveButton?.setOnClickListener {
-            saveSettings()
-        }
-
-        updateSaveButtonState()
+        MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+            .setTitle(R.string.native_driver_preferred_device)
+            .setSingleChoiceItems(labels, selectedIdx) { dialog, which ->
+                dialog.dismiss()
+                pendingNativePreferredDeviceMac = options[which].first
+                checkChanges()
+                updateSettingsList()
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
     }
 
     private fun handleBackPress() {
+        if (header?.handleBack() == true) return
         if (hasChanges) {
             MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
                 .setTitle(R.string.unsaved_changes)
@@ -507,92 +555,136 @@ class SettingsFragment : Fragment() {
     }
 
     private fun updateSaveButtonState() {
-        saveButton?.isEnabled = hasChanges
-        saveButton?.text = if (requiresRestart) getString(R.string.save_and_restart) else getString(R.string.save)
+        header?.setSaveState(enabled = hasChanges, needsReconnect = requiresRestart)
     }
 
     private fun saveSettings() {
+        checkChanges()
+        var audioSessionEnded = false
         val languageChanged = pendingAppLanguage != settings.appLanguage
 
-        pendingAdvancedSettings?.let { settings.isAdvancedSettingsActive = it }
-        pendingUseGps?.let { settings.useGpsForNavigation = it }
-        pendingShowNavigationNotifications?.let { settings.showNavigationNotifications = it }
-        pendingSyncMediaSessionAaMetadata?.let { settings.syncMediaSessionWithAaMetadata = it }
-        pendingResolution?.let { settings.resolutionId = it }
-        pendingDpi?.let { settings.dpiPixelDensity = it }
-        pendingPixelAspectRatioE4?.let { settings.pixelAspectRatioE4 = it }
-        pendingStaticBSSID?.let { settings.staticBSSID = it }
-        pendingFullscreenMode?.let { settings.fullscreenMode = it }
+        pendingUseGps?.let { if (it != settings.useGpsForNavigation) settings.useGpsForNavigation = it }
+        pendingShowNavigationNotifications?.let { if (it != settings.showNavigationNotifications) settings.showNavigationNotifications = it }
+        pendingSyncMediaSessionAaMetadata?.let { if (it != settings.syncMediaSessionWithAaMetadata) settings.syncMediaSessionWithAaMetadata = it }
+        pendingAutoResumePlaybackOnReconnect?.let { if (it != settings.autoResumePlaybackOnReconnect) settings.autoResumePlaybackOnReconnect = it }
+        // The way back from a link the app measured as too slow: it lowered the profile after three
+        // sessions that rendered nothing, and nothing else retires that, because the cap is what
+        // makes the next session render. See VideoStarvationPolicy.shouldCap.
+        val videoProfileChanged =
+            (pendingResolution != null && pendingResolution != settings.resolutionId) ||
+                (pendingFpsLimit != null && pendingFpsLimit != settings.fpsLimit)
+        if (videoProfileChanged) settings.videoProfileStarvationCap = false
+        pendingResolution?.let { if (it != settings.resolutionId) settings.resolutionId = it }
+        pendingDpi?.let { if (it != settings.dpiPixelDensity) settings.dpiPixelDensity = it }
+        pendingPixelAspectRatioE4?.let { if (it != settings.pixelAspectRatioE4) settings.pixelAspectRatioE4 = it }
+        pendingStaticBSSID?.let { if (it != settings.staticBSSID) settings.staticBSSID = it }
+        pendingStaticP2pBSSID?.let { if (it != settings.staticP2pBSSID) settings.staticP2pBSSID = it }
+        pendingFullscreenMode?.let { if (it != settings.fullscreenMode) settings.fullscreenMode = it }
         val oldViewMode = settings.viewMode
-        pendingViewMode?.let { settings.viewMode = it }
-        pendingForceSoftware?.let { settings.forceSoftwareDecoding = it }
-        pendingSoftwareVideoDecoder?.let { settings.softwareVideoDecoder = it }
-        pendingVideoCodec?.let { settings.videoCodec = it }
-        pendingFpsLimit?.let { settings.fpsLimit = it }
-        pendingBluetoothAddress?.let { settings.bluetoothAddress = it }
-        pendingEnableAudioSink?.let { settings.enableAudioSink = it }
-        pendingStaticAudioFocus?.let { settings.staticAudioFocus = it }
+        pendingViewMode?.let { if (it != settings.viewMode) settings.viewMode = it }
+        pendingForceSoftware?.let { if (it != settings.forceSoftwareDecoding) settings.forceSoftwareDecoding = it }
+        pendingSoftwareVideoDecoder?.let { if (it != settings.softwareVideoDecoder) settings.softwareVideoDecoder = it }
+        pendingVideoCodec?.let { if (it != settings.videoCodec) settings.videoCodec = it }
+        pendingFpsLimit?.let { if (it != settings.fpsLimit) settings.fpsLimit = it }
+        pendingBluetoothAddress?.let { if (it != settings.bluetoothAddress) settings.bluetoothAddress = it }
+        pendingBluetoothAnnounceSkip?.let {
+            if (it != BluetoothAnnouncePolicy.isSkip(settings.bluetoothAnnounceMode)) {
+                settings.bluetoothAnnounceMode = BluetoothAnnouncePolicy.storedValue(it)
+            }
+        }
+        pendingEnableAudioSink?.let { if (it != settings.enableAudioSink) settings.enableAudioSink = it }
+        pendingStaticAudioFocus?.let { if (it != settings.staticAudioFocus) settings.staticAudioFocus = it }
         // Re-picking the focus mode is the way back from a wrong verdict: AUTO learns that taking
         // system audio focus stops the phone's own playback and then stops asking for it, and two
         // tracks that happened to end quickly can teach it that wrongly.
         val focusModeChanged = pendingPlaybackFocusMode != null && pendingPlaybackFocusMode != settings.playbackFocusMode
-        pendingPlaybackFocusMode?.let { settings.playbackFocusMode = it }
+        pendingPlaybackFocusMode?.let { if (it != settings.playbackFocusMode) settings.playbackFocusMode = it }
         if (focusModeChanged) settings.playbackFocusSelfDefeating = false
-        pendingUseAacAudio?.let { settings.useAacAudio = it }
-        pendingAttachHwDspEqualizer?.let { settings.attachHwDspEqualizer = it }
-        pendingMicInputSource?.let { settings.micInputSource = it }
-        pendingEnableRotary?.let { settings.enableRotary = it }
-        pendingMediaKeyRouting?.let { settings.mediaKeyRouting = it }
-        pendingAudioLatencyMultiplier?.let { settings.audioLatencyMultiplier = it }
-        pendingAudioQueueCapacity?.let { settings.audioQueueCapacity = it }
-        pendingShowFpsCounter?.let { settings.showFpsCounter = it }
-        pendingShowToastMessages?.let { settings.showToastMessages = it }
-        pendingScreenOrientation?.let { settings.screenOrientation = it }
+        pendingUseAacAudio?.let { if (it != settings.useAacAudio) settings.useAacAudio = it }
+        pendingUseAAudioOutput?.let { if (it != settings.useAAudioOutput) settings.useAAudioOutput = it }
+        pendingAttachHwDspEqualizer?.let { if (it != settings.attachHwDspEqualizer) settings.attachHwDspEqualizer = it }
+        pendingMicInputSource?.let { if (it != settings.micInputSource) settings.micInputSource = it }
+        pendingEnableRotary?.let { if (it != settings.enableRotary) settings.enableRotary = it }
+        pendingMediaKeyRouting?.let { if (it != settings.mediaKeyRouting) settings.mediaKeyRouting = it }
+        pendingAudioLatencyMultiplier?.let { if (it != settings.audioLatencyMultiplier) settings.audioLatencyMultiplier = it }
+        pendingAudioTimeCorrectionMode?.let { if (it != settings.audioMatchingMode) settings.audioMatchingMode = it }
+        pendingAudioQueueCapacity?.let { if (it != settings.audioQueueCapacity) settings.audioQueueCapacity = it }
+        pendingShowToastMessages?.let { if (it != settings.showToastMessages) settings.showToastMessages = it }
+        pendingScreenOrientation?.let { if (it != settings.screenOrientation) settings.screenOrientation = it }
 
-        pendingMediaVolumeOffset?.let { settings.mediaVolumeOffset = it }
-        pendingGuidanceVolumeOffset?.let { settings.guidanceVolumeOffset = it }
-        pendingSystemVolumeOffset?.let { settings.systemVolumeOffset = it }
+        pendingMediaVolumeOffset?.let { if (it != settings.mediaVolumeOffset) settings.mediaVolumeOffset = it }
+        pendingGuidanceVolumeOffset?.let { if (it != settings.guidanceVolumeOffset) settings.guidanceVolumeOffset = it }
+        pendingSystemVolumeOffset?.let { if (it != settings.systemVolumeOffset) settings.systemVolumeOffset = it }
 
 
-        pendingAppLanguage?.let { settings.appLanguage = it }
+        pendingAppLanguage?.let { if (it != settings.appLanguage) settings.appLanguage = it }
 
         val hudMirroringChanged = pendingHudMirroring != null && pendingHudMirroring != settings.hudMirroring
 
-        // Save the stretch to fill preference
-        pendingStretchToFill?.let { settings.stretchToFill = it }
-        pendingForcedScale?.let { settings.forcedScale = it }
-        pendingHudMirroring?.let { settings.hudMirroring = it }
-        pendingUseMeasuredTouchSurface?.let { settings.useMeasuredTouchSurface = it }
+        pendingEnableCarLauncher?.let {
+            if (it != settings.enableCarLauncher) settings.enableCarLauncher = it
+            CarLauncherManager.setLauncherEnabled(requireContext(), it)
+        }
+        pendingEnableFloatingButton?.let { if (it != settings.enableFloatingButton) settings.enableFloatingButton = it }
+        pendingFloatingButtonConnectionStatusMode?.let { if (it != settings.floatingButtonConnectionStatusMode) settings.floatingButtonConnectionStatusMode = it }
+        pendingFloatingButtonDisconnectedOpacityPercent?.let { if (it != settings.floatingButtonDisconnectedOpacityPercent) settings.floatingButtonDisconnectedOpacityPercent = it }
+        pendingFloatingButtonSizeDp?.let { if (it != settings.floatingButtonSizeDp) settings.floatingButtonSizeDp = it }
+        pendingFloatingButtonOpacityPercent?.let { if (it != settings.floatingButtonOpacityPercent) settings.floatingButtonOpacityPercent = it }
+        pendingFloatingButtonXPercent?.let { if (it != settings.floatingButtonXPercent) settings.floatingButtonXPercent = it }
+        pendingFloatingButtonYPercent?.let { if (it != settings.floatingButtonYPercent) settings.floatingButtonYPercent = it }
+        pendingAaExitAction?.let { if (it != settings.rawAaExitAction) settings.rawAaExitAction = it }
+        FloatingButtonManager.update(requireContext())
+        pendingVideoFitMode?.let { if (it != settings.videoFitMode) settings.videoFitMode = it }
+        pendingForcedScale?.let { if (it != settings.forcedScale) settings.forcedScale = it }
+        pendingHudMirroring?.let { if (it != settings.hudMirroring) settings.hudMirroring = it }
 
-        pendingKillOnDisconnect?.let { settings.killOnDisconnect = it }
-        pendingRaiseProjectionDuringCall?.let { settings.raiseProjectionDuringCall = it }
-        pendingAutoEnableHotspot?.let { settings.autoEnableHotspot = it }
-        pendingFakeSpeed?.let { settings.fakeSpeed = it }
-        pendingUseLibusb?.let { settings.useLibusb = it }
+        pendingKillOnDisconnect?.let { if (it != settings.rawKillOnDisconnect) settings.rawKillOnDisconnect = it }
+        pendingAutoKillOemApps?.let { if (it != settings.autoKillOemApps) settings.autoKillOemApps = it }
+        pendingRaiseProjectionDuringCall?.let { if (it != settings.raiseProjectionDuringCall) settings.raiseProjectionDuringCall = it }
+        pendingAutoEnableHotspot?.let { if (it != settings.autoEnableHotspot) settings.autoEnableHotspot = it }
+        pendingFakeSpeed?.let { if (it != settings.fakeSpeed) settings.fakeSpeed = it }
+        pendingAutoRestartWifi?.let { if (it != settings.autoRestartWifiWhenP2pStuck) settings.autoRestartWifiWhenP2pStuck = it }
+        pendingUseLibusb?.let { if (it != settings.useLibusb) settings.useLibusb = it }
+        pendingNarrowBandProfileCap?.let { if (it != settings.narrowBandProfileCap) settings.narrowBandProfileCap = it }
+        pendingDebugVideoLowLatency?.let { if (it != settings.debugVideoLowLatency) settings.debugVideoLowLatency = it }
+        pendingAllowExternalConfiguration?.let { if (it != settings.allowExternalConfiguration) settings.allowExternalConfiguration = it }
+        pendingKeepDummyVpnDuringSession?.let { if (it != settings.keepDummyVpnDuringSession) settings.keepDummyVpnDuringSession = it }
 
-        val oldWifiMode = settings.wifiConnectionMode
-        val oldHelperStrategy = settings.helperConnectionStrategy
-        val oldBluetoothManagerServiceName = settings.bluetoothManagerServiceName
-        pendingWifiConnectionMode?.let { settings.wifiConnectionMode = it }
-        pendingHelperConnectionStrategy?.let { settings.helperConnectionStrategy = it }
-        pendingWaitForWifi?.let { settings.waitForWifiBeforeWifiDirect = it }
-        pendingWaitForWifiTimeout?.let { settings.waitForWifiTimeout = it }
-        pendingBluetoothManagerServiceName?.let { settings.bluetoothManagerServiceName = it }
-        pendingManualSecondaryBluetoothServiceName?.let { settings.manualSecondaryBluetoothServiceName = it }
-        pendingNativeWifiVersionExchange?.let { settings.nativeWifiVersionExchange = it }
-        pendingNativeApTransport?.let { settings.nativeApStrategy = it }
-        pendingWifiDirectBand?.let { settings.wifiDirectBand = it }
-        pendingHotspotBand?.let { settings.hotspotBand = it }
-        pendingHotspotSsid?.let { settings.hotspotSsid = it }
-        pendingHotspotPassword?.let { settings.hotspotPassword = it }
-        pendingHotspotInterface?.let { settings.hotspotInterface = it }
-        pendingInsetLeft?.let { settings.insetLeft = it }
-        pendingInsetTop?.let { settings.insetTop = it }
-        pendingInsetRight?.let { settings.insetRight = it }
-        pendingInsetBottom?.let { settings.insetBottom = it }
-        pendingHidePhoneSignal?.let { settings.hidePhoneSignal = it }
-        pendingHideBatteryLevel?.let { settings.hideBatteryLevel = it }
-        pendingHideClock?.let { settings.hideClock = it }
+        val wirelessConfigBefore = wirelessRearmConfig()
+        pendingWifiConnectionMode?.let { if (it != settings.wifiConnectionMode) settings.wifiConnectionMode = it }
+        pendingHelperConnectionStrategy?.let { if (it != settings.helperConnectionStrategy) settings.helperConnectionStrategy = it }
+        pendingWaitForWifi?.let { if (it != settings.waitForWifiBeforeWifiDirect) settings.waitForWifiBeforeWifiDirect = it }
+        pendingWaitForWifiTimeout?.let { if (it != settings.waitForWifiTimeout) settings.waitForWifiTimeout = it }
+        pendingBluetoothManagerServiceName?.let { if (it != settings.bluetoothManagerServiceName) settings.bluetoothManagerServiceName = it }
+        pendingNativeAaIgnoreExternalBt?.let { if (it != settings.nativeAaIgnoreExternalBt) settings.nativeAaIgnoreExternalBt = it }
+        pendingExternalBtZbtTransport?.let { if (it != settings.externalBtZbtTransport) settings.externalBtZbtTransport = it }
+        pendingExternalBtBlinkTransport?.let { if (it != settings.externalBtBlinkTransport) settings.externalBtBlinkTransport = it }
+        pendingNativeApTransport?.let { if (it != settings.nativeApStrategy) settings.nativeApStrategy = it }
+        pendingNativeDriverSelectionMode?.let { if (it != settings.nativeDriverSelectionMode) settings.nativeDriverSelectionMode = it }
+        pendingNativeDriverSelectionTimeout?.let { if (it != settings.nativeDriverSelectionTimeoutSec) settings.nativeDriverSelectionTimeoutSec = it }
+        pendingNativePreferredDeviceMac?.let { if (it != settings.nativePreferredDeviceMac) settings.nativePreferredDeviceMac = it }
+        pendingWifiDirectBand?.let { if (it != settings.wifiDirectBand) settings.wifiDirectBand = it }
+        pendingWifiDirectStableIdentity?.let { if (it != settings.wifiDirectStableIdentity) settings.wifiDirectStableIdentity = it }
+        // The pair is written whole, null included, so a Reset really does hand the choice back.
+        pendingWifiDirectIdentityUserSet?.let {
+            val moved = settings.wifiDirectGroupIdentity != pendingWifiDirectGroupIdentity
+            if (it != settings.wifiDirectIdentityUserSet) settings.wifiDirectIdentityUserSet = it
+            if (moved) settings.wifiDirectGroupIdentity = pendingWifiDirectGroupIdentity
+            if (moved) rotateWifiDirectIdentityNow()
+        }
+        pendingStationStandDownMode?.let { if (it != settings.stationStandDownMode) settings.stationStandDownMode = it }
+        pendingHotspotBand?.let { if (it != settings.hotspotBand) settings.hotspotBand = it }
+        pendingFiveGhzChannel?.let { if (it != settings.fiveGhzChannel) settings.fiveGhzChannel = it }
+        pendingHotspotSsid?.let { if (it != settings.hotspotSsid) settings.hotspotSsid = it }
+        pendingHotspotPassword?.let { if (it != settings.hotspotPassword) settings.hotspotPassword = it }
+        pendingHotspotInterface?.let { if (it != settings.hotspotInterface) settings.hotspotInterface = it }
+        pendingInsetLeft?.let { if (it != settings.insetLeft) settings.insetLeft = it }
+        pendingInsetTop?.let { if (it != settings.insetTop) settings.insetTop = it }
+        pendingInsetRight?.let { if (it != settings.insetRight) settings.insetRight = it }
+        pendingInsetBottom?.let { if (it != settings.insetBottom) settings.insetBottom = it }
+        pendingHidePhoneSignal?.let { if (it != settings.hidePhoneSignal) settings.hidePhoneSignal = it }
+        pendingHideBatteryLevel?.let { if (it != settings.hideBatteryLevel) settings.hideBatteryLevel = it }
+        pendingHideClock?.let { if (it != settings.hideClock) settings.hideClock = it }
 
         settings.commit()
         AppLog.init(settings, requireContext().applicationContext)
@@ -602,27 +694,21 @@ class SettingsFragment : Fragment() {
         // recovery use via recreateProjectionView(). If another setting is already forcing a
         // restart below, that path covers it; with no active session the new value is simply
         // used on the next launch.
-        if (oldViewMode != settings.viewMode && !requiresRestart) {
+        if (oldViewMode != settings.viewMode && !requiresServiceRestart) {
             LocalBroadcastManager.getInstance(requireContext()).sendBroadcast(
                 Intent(QuickSettingsFragment.ACTION_SETTINGS_CHANGED)
                     .putExtra(QuickSettingsFragment.EXTRA_NEEDS_VIEW_RECREATE, true)
             )
         }
 
-        if (oldWifiMode != settings.wifiConnectionMode ||
-            oldHelperStrategy != settings.helperConnectionStrategy ||
-            oldBluetoothManagerServiceName != settings.bluetoothManagerServiceName) {
-            val intent = Intent(requireContext(), AapService::class.java).apply {
-                val mode = settings.wifiConnectionMode
-                action = if (mode != WifiLauncherMode.MANUAL)
-                    AapService.ACTION_START_WIRELESS else AapService.ACTION_STOP_WIRELESS
-            }
-            requireContext().startService(intent)
+        if (WirelessRearmPolicy.requiresRearm(wirelessConfigBefore, wirelessRearmConfig())) {
+            AapService.applyWirelessSettings(requireContext(),
+                startWireless = settings.wifiConnectionMode != WifiLauncherMode.MANUAL && settings.showsWifi())
         }
 
-        if (requiresRestart) {
+        if (requiresServiceRestart) {
             if (App.provide(requireContext()).commManager.isConnected) {
-                Toast.makeText(context, getString(R.string.stopping_service), Toast.LENGTH_SHORT).show()
+                ToastUtils.showToast(context, getString(R.string.stopping_service), Toast.LENGTH_SHORT, force = true)
                 val stopServiceIntent = Intent(requireContext(), AapService::class.java).apply {
                     action = AapService.ACTION_STOP_SERVICE
                 }
@@ -630,13 +716,23 @@ class SettingsFragment : Fragment() {
             }
         }
 
+        if (requiresRestart && !requiresServiceRestart) {
+            val manager = App.provide(requireContext()).commManager
+            val connected = manager.isConnected
+            manager.applyAudioSettings()
+            audioSessionEnded = connected && !manager.isConnected
+        }
+
         // Reset change tracking
         hasChanges = false
         requiresRestart = false
+        requiresServiceRestart = false
         updateSaveButtonState()
         updateSettingsList()
 
-        Toast.makeText(context, getString(R.string.settings_saved), Toast.LENGTH_SHORT).show()
+        ToastUtils.showToast(context,
+            getString(if (audioSessionEnded) R.string.audio_settings_reconnect else R.string.settings_saved),
+            if (audioSessionEnded) Toast.LENGTH_LONG else Toast.LENGTH_SHORT, force = true)
 
         if (languageChanged || hudMirroringChanged) {
             requireActivity().recreate()
@@ -645,77 +741,17 @@ class SettingsFragment : Fragment() {
 
     private fun checkChanges() {
         // Check for any changes
-        val anyChange = pendingAdvancedSettings != settings.isAdvancedSettingsActive ||
-                        pendingUseGps != settings.useGpsForNavigation ||
-                        pendingShowNavigationNotifications != settings.showNavigationNotifications ||
-                        pendingSyncMediaSessionAaMetadata != settings.syncMediaSessionWithAaMetadata ||
-                        pendingResolution != settings.resolutionId ||
-                        pendingDpi != settings.dpiPixelDensity ||
-                        pendingPixelAspectRatioE4 != settings.pixelAspectRatioE4 ||
-                        pendingStaticBSSID != settings.staticBSSID ||
-                        pendingFullscreenMode != settings.fullscreenMode ||
-                        pendingViewMode != settings.viewMode ||
-                        pendingForceSoftware != settings.forceSoftwareDecoding ||
-                        pendingSoftwareVideoDecoder != settings.softwareVideoDecoder ||
-                        pendingVideoCodec != settings.videoCodec ||
-                        pendingFpsLimit != settings.fpsLimit ||
-                        pendingBluetoothAddress != settings.bluetoothAddress ||
-                        pendingEnableAudioSink != settings.enableAudioSink ||
-                        pendingStaticAudioFocus != settings.staticAudioFocus ||
-                        pendingPlaybackFocusMode != settings.playbackFocusMode ||
-                        pendingUseAacAudio != settings.useAacAudio ||
-                        pendingAttachHwDspEqualizer != settings.attachHwDspEqualizer ||
-                        pendingMicInputSource != settings.micInputSource ||
-                        pendingEnableRotary != settings.enableRotary ||
-                        pendingMediaKeyRouting != settings.mediaKeyRouting ||
-                        pendingAudioLatencyMultiplier != settings.audioLatencyMultiplier ||
-                        pendingAudioQueueCapacity != settings.audioQueueCapacity ||
-                        pendingShowFpsCounter != settings.showFpsCounter ||
-                        pendingShowToastMessages != settings.showToastMessages ||
-                        pendingScreenOrientation != settings.screenOrientation ||
-                        pendingAppLanguage != settings.appLanguage ||
-                        pendingStretchToFill != settings.stretchToFill ||
-                        pendingForcedScale != settings.forcedScale ||
-                        pendingHudMirroring != settings.hudMirroring ||
-                        pendingUseMeasuredTouchSurface != settings.useMeasuredTouchSurface ||
-                        pendingInsetLeft != settings.insetLeft ||
-                        pendingInsetTop != settings.insetTop ||
-                        pendingInsetRight != settings.insetRight ||
-                        pendingInsetBottom != settings.insetBottom ||
-                        pendingMediaVolumeOffset != settings.mediaVolumeOffset ||
-                        pendingGuidanceVolumeOffset != settings.guidanceVolumeOffset ||
-                        pendingSystemVolumeOffset != settings.systemVolumeOffset ||
-                        pendingKillOnDisconnect != settings.killOnDisconnect ||
-                        pendingRaiseProjectionDuringCall != settings.raiseProjectionDuringCall ||
-                        pendingAutoEnableHotspot != settings.autoEnableHotspot ||
-                        pendingFakeSpeed != settings.fakeSpeed ||
-                        pendingWifiConnectionMode != settings.wifiConnectionMode ||
-                        pendingHelperConnectionStrategy != settings.helperConnectionStrategy ||
-                        pendingWaitForWifi != settings.waitForWifiBeforeWifiDirect ||
-                        pendingWaitForWifiTimeout != settings.waitForWifiTimeout ||
-                        pendingBluetoothManagerServiceName != settings.bluetoothManagerServiceName ||
-                        pendingManualSecondaryBluetoothServiceName != settings.manualSecondaryBluetoothServiceName ||
-                        pendingNativeWifiVersionExchange != settings.nativeWifiVersionExchange ||
-                        pendingNativeApTransport != settings.nativeApStrategy ||
-                        pendingWifiDirectBand != settings.wifiDirectBand ||
-                        pendingHotspotBand != settings.hotspotBand ||
-                        pendingHotspotSsid != settings.hotspotSsid ||
-                        pendingHotspotPassword != settings.hotspotPassword ||
-                        pendingHotspotInterface != settings.hotspotInterface ||
-                        pendingUseLibusb != settings.useLibusb ||
-                        pendingHideBatteryLevel != settings.hideBatteryLevel ||
-                        pendingHidePhoneSignal != settings.hidePhoneSignal ||
-                        pendingHideClock != settings.hideClock
-
-        hasChanges = anyChange
+        hasChanges = pending.differsFrom(settings)
 
         // Check for restart requirement
         requiresRestart = pendingResolution != settings.resolutionId ||
+                          pendingVideoFitMode != settings.videoFitMode ||
                           pendingVideoCodec != settings.videoCodec ||
                           pendingFpsLimit != settings.fpsLimit ||
                           pendingDpi != settings.dpiPixelDensity ||
                           pendingPixelAspectRatioE4 != settings.pixelAspectRatioE4 ||
-            pendingStaticBSSID != settings.staticBSSID ||
+                          pendingStaticBSSID != settings.staticBSSID ||
+                          pendingStaticP2pBSSID != settings.staticP2pBSSID ||
                           pendingForceSoftware != settings.forceSoftwareDecoding ||
                           pendingSoftwareVideoDecoder != settings.softwareVideoDecoder ||
                           pendingEnableRotary != settings.enableRotary ||
@@ -723,9 +759,31 @@ class SettingsFragment : Fragment() {
                           pendingStaticAudioFocus != settings.staticAudioFocus ||
                           pendingPlaybackFocusMode != settings.playbackFocusMode ||
                           pendingUseAacAudio != settings.useAacAudio ||
+                          pendingUseAAudioOutput != settings.useAAudioOutput ||
                           pendingAttachHwDspEqualizer != settings.attachHwDspEqualizer ||
                           pendingAudioLatencyMultiplier != settings.audioLatencyMultiplier ||
+                          pendingAudioTimeCorrectionMode != settings.audioMatchingMode ||
                           pendingAudioQueueCapacity != settings.audioQueueCapacity ||
+                          pendingInsetLeft != settings.insetLeft ||
+                          pendingInsetTop != settings.insetTop ||
+                          pendingInsetRight != settings.insetRight ||
+                          pendingInsetBottom != settings.insetBottom ||
+                          pendingWifiConnectionMode != settings.wifiConnectionMode ||
+                          pendingUseLibusb != settings.useLibusb
+
+        // Audio settings may end just the projection session. Service-level changes retain
+        // their broader restart policy and take precedence when both kinds are saved.
+        requiresServiceRestart = pendingResolution != settings.resolutionId ||
+                          pendingVideoFitMode != settings.videoFitMode ||
+                          pendingVideoCodec != settings.videoCodec ||
+                          pendingFpsLimit != settings.fpsLimit ||
+                          pendingDpi != settings.dpiPixelDensity ||
+                          pendingPixelAspectRatioE4 != settings.pixelAspectRatioE4 ||
+                          pendingStaticBSSID != settings.staticBSSID ||
+                          pendingStaticP2pBSSID != settings.staticP2pBSSID ||
+                          pendingForceSoftware != settings.forceSoftwareDecoding ||
+                          pendingSoftwareVideoDecoder != settings.softwareVideoDecoder ||
+                          pendingEnableRotary != settings.enableRotary ||
                           pendingInsetLeft != settings.insetLeft ||
                           pendingInsetTop != settings.insetTop ||
                           pendingInsetRight != settings.insetRight ||
@@ -744,6 +802,7 @@ class SettingsFragment : Fragment() {
         val app = App.provide(requireContext())
         val scrollState = settingsRecyclerView.layoutManager?.onSaveInstanceState()
         val items = mutableListOf<SettingItem>()
+        scopeNotice()?.let { items.add(it) }
 
         // --- General Settings ---
         items.add(SettingItem.CategoryHeader("general", R.string.category_general))
@@ -827,15 +886,7 @@ class SettingsFragment : Fragment() {
             }
         ))
 
-        // UI Scale (example dialog similar to Custom Insets) - appear after vehicle info
-        items.add(SettingItem.SettingEntry(
-            stableId = "uiScale",
-            nameResId = R.string.ui_scale,
-            value = "${getString(R.string.ui_scale_home)}: ${pendingUiScaleHomePercent ?: 100}% · ${getString(R.string.ui_scale_settings)}: ${pendingUiScaleSettingsPercent ?: 100}%",
-            onClick = { _ ->
-                showUiScaleDialog()
-            }
-        ))
+
 
         items.add(SettingItem.ToggleSettingEntry(
             stableId = "showToastMessages",
@@ -866,6 +917,29 @@ class SettingsFragment : Fragment() {
         // --- Wireless Connection ---
         items.add(SettingItem.CategoryHeader("wirelessConnection", R.string.category_wireless))
 
+        if (Build.VERSION.SDK_INT >= 26) {
+            items.add(SettingItem.SettingEntry(
+                stableId = "wifiScanControl",
+                nameResId = R.string.wifi_scan_title,
+                value = wifiScanSummary(),
+                // The row title does not name Shizuku; let the settings search find it.
+                searchKeywords = "Shizuku",
+                onClick = { _ ->
+                    // The sub-screen applies immediately; do not silently lose unsaved controls
+                    // in this screen when navigation recreates its view on return.
+                    if (hasChanges) MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+                        .setTitle(R.string.unsaved_changes)
+                        .setMessage(R.string.unsaved_changes_message)
+                        .setPositiveButton(R.string.discard) { _, _ ->
+                            findNavController().navigate(R.id.wifiScanSettingsFragment)
+                        }
+                        .setNegativeButton(R.string.cancel, null)
+                        .show()
+                    else findNavController().navigate(R.id.wifiScanSettingsFragment)
+                }
+            ))
+        }
+
         // Add 2.4GHz Warning Banner
         items.add(SettingItem.InfoBanner(
             stableId = "wireless24ghzWarning",
@@ -882,7 +956,7 @@ class SettingsFragment : Fragment() {
             WifiLauncherMode.HELPER -> 0 // Helper
             WifiLauncherMode.NATIVE -> 1 // Native
             WifiLauncherMode.MANUAL, WifiLauncherMode.AUTO -> 2 // Server
-            else -> 2
+            else -> 1
         }
 
         items.add(SettingItem.SegmentedButtonSettingEntry(
@@ -895,11 +969,12 @@ class SettingsFragment : Fragment() {
                     0 -> WifiLauncherMode.HELPER // Helper
                     1 -> WifiLauncherMode.NATIVE // Native
                     2 -> if (pendingWifiConnectionMode == WifiLauncherMode.MANUAL) WifiLauncherMode.MANUAL else WifiLauncherMode.AUTO // Keep manual/auto choice if already in server mode
-                    else -> WifiLauncherMode.AUTO
+                    else -> WifiLauncherMode.NATIVE
                 }
 
                 if (newMode == WifiLauncherMode.NATIVE) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    if (!ExternalBtTransportPolicy.usesExternalModule(pendingExternalBtRoute()) &&
+                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
                         ContextCompat.checkSelfPermission(requireContext(), android.Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
                         bluetoothPermissionLauncher.launch(android.Manifest.permission.BLUETOOTH_CONNECT)
                     } else {
@@ -948,6 +1023,9 @@ class SettingsFragment : Fragment() {
                 // the setting governing this route unreachable from the screen that selects it.
                 addHotspotToggle(items)
                 addHotspotBandSetting(items)
+                if (pendingHotspotBandPreference() != HotspotBandPreference.FORCE_2_4GHZ) {
+                    addFiveGhzChannelSetting(items)
+                }
 
                 // The automatic read goes through the same non-public API that a locked-down
                 // device refuses outright, so on those units this override is the only way the
@@ -1017,6 +1095,17 @@ class SettingsFragment : Fragment() {
                         )
                     }
                 ))
+
+                // The one route onto a unit whose Bluetooth cannot carry the handshake: the phone
+                // reads the network and our TCP endpoint straight off the screen. Only on this
+                // transport, and only from here, because the QR is worth showing exactly where the
+                // network it names is configured.
+                items.add(SettingItem.SettingEntry(
+                    stableId = "projectionSetupQr",
+                    nameResId = R.string.native_aa_setup_qr_title,
+                    value = getString(R.string.native_aa_setup_qr_description),
+                    onClick = { _ -> ProjectionSetupQrDialog.show(requireContext()) }
+                ))
             }
 
             // The band choice lives here rather than under Debug because it is read in exactly
@@ -1035,21 +1124,83 @@ class SettingsFragment : Fragment() {
             if (pendingNativeTransport() == NativeTransport.WIFI_DIRECT) {
                 addWifiDirectBandSetting(items)
 
-                // The 5 GHz rung has two non-DFS ranges and a regulatory domain can refuse the
-                // lower one, so this only means anything where a 5 GHz channel is asked for at all.
+                // Only where a 5 GHz channel is asked for at all. Replaces a two-position toggle
+                // that could say 36 or 149 and nothing between.
                 if (pendingP2pBandPreference() != P2pBandPreference.FORCE_2_4GHZ) {
-                    items.add(SettingItem.ToggleSettingEntry(
-                        stableId = "p2pLegacyFiveGhzUpperBand",
-                        nameResId = R.string.p2p_legacy_5ghz_upper,
-                        descriptionResId = R.string.p2p_legacy_5ghz_upper_description,
-                        isChecked = settings.p2pLegacyFiveGhzUpperBand,
-                        searchKeywords = "channel 149 upper 5 ghz unii region",
-                        onCheckedChanged = { isChecked ->
-                            settings.p2pLegacyFiveGhzUpperBand = isChecked
-                            updateSettingsList()
-                        }
+                    addFiveGhzChannelSetting(items)
+                }
+
+                addWifiDirectIdentitySettings(items)
+                addStationStandDownSetting(items)
+            }
+
+            if (ExternalBtTransportPolicy.usesExternalModule(pendingExternalBtRoute())) {
+                items.add(SettingItem.InfoBanner(
+                    stableId = "externalBtModuleControlsHint",
+                    textResId = R.string.external_bt_module_controls_hint
+                ))
+                settings.lastExternalModulePhoneMac.takeIf { it.isNotBlank() }?.let { phoneMac ->
+                    items.add(SettingItem.SettingEntry(
+                        stableId = "externalBtModuleLastPhone",
+                        nameResId = R.string.external_bt_module_last_phone,
+                        value = phoneMac,
+                        onClick = { }
                     ))
                 }
+            } else {
+            // Multi-Driver Selection settings for Native AA
+            val currentDriverMode = pendingNativeDriverSelectionMode ?: NativeDriverSelectionPolicy.Mode.AUTO
+            items.add(SettingItem.SegmentedButtonSettingEntry(
+                stableId = "nativeDriverSelectionMode",
+                nameResId = R.string.native_driver_selection_title,
+                options = listOf(
+                    getString(R.string.native_driver_selection_mode_off),
+                    getString(R.string.native_driver_selection_mode_auto),
+                    getString(R.string.native_driver_selection_mode_always)
+                ),
+                selectedIndex = currentDriverMode.id,
+                onOptionSelected = { index ->
+                    pendingNativeDriverSelectionMode = NativeDriverSelectionPolicy.Mode.fromId(index)
+                    checkChanges()
+                    updateSettingsList()
+                }
+            ))
+
+            if (currentDriverMode != NativeDriverSelectionPolicy.Mode.DISABLED) {
+                val currentTimeout = pendingNativeDriverSelectionTimeout ?: NativeDriverSelectionPolicy.DEFAULT_TIMEOUT_SEC
+                items.add(SettingItem.SliderSettingEntry(
+                    stableId = "nativeDriverSelectionTimeout",
+                    nameResId = R.string.native_driver_selection_timeout,
+                    value = "${currentTimeout}s",
+                    sliderValue = currentTimeout.toFloat(),
+                    valueFrom = NativeDriverSelectionPolicy.MIN_TIMEOUT_SEC.toFloat(),
+                    valueTo = NativeDriverSelectionPolicy.MAX_TIMEOUT_SEC.toFloat(),
+                    stepSize = 1f,
+                    onValueChanged = { newVal ->
+                        pendingNativeDriverSelectionTimeout = newVal.toInt()
+                        checkChanges()
+                    }
+                ))
+
+                val currentPrefMac = pendingNativePreferredDeviceMac.orEmpty()
+                // Empty without BLUETOOTH_CONNECT: the row then shows the stored address, and
+                // tapping it asks for the permission instead of crashing the screen on open.
+                val bonded = BluetoothHelper.pairedDevicesOrEmpty(requireContext())
+                val prefDeviceName = bonded.firstOrNull { it.address.equals(currentPrefMac, ignoreCase = true) }?.name
+                    ?: if (currentPrefMac.isNotEmpty()) currentPrefMac else getString(R.string.driver_none)
+
+                items.add(SettingItem.SettingEntry(
+                    stableId = "nativePreferredDevice",
+                    nameResId = R.string.native_driver_preferred_device,
+                    value = prefDeviceName,
+                    onClick = { _ ->
+                        if (BluetoothHelper.canReadPairedDevices(requireContext())) {
+                            showPreferredDevicePicker()
+                        } else {
+                            preferredDevicePermissionLauncher.launch(android.Manifest.permission.BLUETOOTH_CONNECT)
+                        }
+                    }
+                ))
             }
 
             val currentServiceName = pendingBluetoothManagerServiceName ?: "bluetooth_manager"
@@ -1077,71 +1228,164 @@ class SettingsFragment : Fragment() {
                 }
             ))
 
-            val manualSecondary = pendingManualSecondaryBluetoothServiceName
+            // An action, not a switch: the wake's cost is a property of this unit's own Bluetooth
+            // stack, which is measured rather than asked. What a user can do is ask for the
+            // measurement again, which is the only way back for a unit condemned by one reading.
             items.add(SettingItem.SettingEntry(
-                stableId = "manualSecondaryBluetoothService",
-                nameResId = R.string.manual_secondary_bt_service_title,
-                value = if (manualSecondary.isNullOrEmpty()) getString(R.string.auto)
-                         else BluetoothHelper.getAdapterDescription(requireContext(), manualSecondary),
+                stableId = "nativeAaWakeRemeasure",
+                nameResId = R.string.native_aa_wake_remeasure,
+                value = getString(
+                    when (NativeAaWakeDamagePolicy.Verdict.of(settings.nativeAaWakeDamageVerdict)) {
+                        NativeAaWakeDamagePolicy.Verdict.UNKNOWN -> R.string.native_aa_wake_verdict_unmeasured
+                        NativeAaWakeDamagePolicy.Verdict.SAFE -> R.string.native_aa_wake_verdict_safe
+                        NativeAaWakeDamagePolicy.Verdict.DESTRUCTIVE -> R.string.native_aa_wake_verdict_destructive
+                    }
+                ),
+                searchKeywords = "bluetooth wake poke hands-free handsfree link reset measure again",
                 onClick = { _ ->
-                    DialogUtils.showTextInputDialogWithMessage(
-                        requireContext(),
-                        R.string.manual_secondary_bt_service_title,
-                        R.string.manual_secondary_bt_service_message,
-                        manualSecondary ?: "",
-                        { newVal ->
-                            pendingManualSecondaryBluetoothServiceName = newVal.trim()
-                            checkChanges()
+                    MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+                        .setTitle(R.string.native_aa_wake_remeasure)
+                        .setMessage(R.string.native_aa_wake_remeasure_confirm)
+                        .setPositiveButton(android.R.string.ok) { _, _ ->
+                            settings.nativeAaWakeDamageVerdict = 0
+                            settings.nativeAaRadioCycleVerdict = 0
+                            settings.nativeAaWakeArmingsWithoutSession = 0
+                            ToastUtils.showToast(
+                                requireContext(),
+                                R.string.native_aa_wake_remeasure_done,
+                                Toast.LENGTH_LONG,
+                                force = true
+                            )
                             updateSettingsList()
                         }
-                    )
+                        .setNegativeButton(android.R.string.cancel, null)
+                        .show()
                 }
             ))
+            }
 
-            items.add(SettingItem.ToggleSettingEntry(
-                stableId = "nativeWifiVersionExchange",
-                nameResId = R.string.native_wifi_version_exchange,
-                descriptionResId = R.string.native_wifi_version_exchange_description,
-                isChecked = pendingNativeWifiVersionExchange ?: false,
-                onCheckedChanged = { isChecked ->
-                    pendingNativeWifiVersionExchange = isChecked
-                    checkChanges()
-                    updateSettingsList()
-                }
-            ))
+            // Moved out of the Android-radio-only settings block so this existing override is
+            // also available on the module route. Keep its setting key and callback unchanged;
+            // firmware candidates need the same way to explicitly choose Android Bluetooth.
+            // ZbtDiscovery reuses the established detector and reads its selected cache here,
+            // never a socket. A negative detection can read metadata again on a later rebuild.
+            // Preserve the original no-op-control rule: explicit ZBT or BLINK toggles win over
+            // this switch. Keep an already checked switch visible so it can still be cleared.
+            // FYT retains this override for a phone actually paired with the Android radio.
+            val radioDiscovery = ZbtDiscovery.snapshot()
+            val radioFytEvidence = BluetoothHelper.fytModuleEvidence
+            val ignoreChecked = pendingNativeAaIgnoreExternalBt ?: settings.nativeAaIgnoreExternalBt
+            val hctService = HctServiceObserver.available(requireContext())
+            if (ExternalBtTransportPolicy.showsAndroidRadioOverride(
+                    radioDiscovery,
+                    pendingExternalBtZbtTransport ?: settings.externalBtZbtTransport,
+                    ignoreChecked,
+                    pendingExternalBtBlinkTransport ?: settings.externalBtBlinkTransport,
+                    radioFytEvidence,
+                    hctService
+                )) {
+                items.add(SettingItem.ToggleSettingEntry(
+                    stableId = "nativeAaIgnoreExternalBt",
+                    nameResId = R.string.native_aa_ignore_external_bt,
+                    descriptionResId = if ((radioDiscovery.decision.requiresIdentity || hctService) && radioFytEvidence == null)
+                        R.string.native_aa_candidate_android_radio_description else R.string.native_aa_ignore_external_bt_description,
+                    isChecked = ignoreChecked,
+                    searchKeywords = "external bluetooth module rfcomm override compatibility anyway",
+                    onCheckedChanged = { isChecked ->
+                        pendingNativeAaIgnoreExternalBt = isChecked
+                        checkChanges()
+                        updateSettingsList()
+                    }
+                ))
+            }
 
             // Rendering it here is half the gate: AapService re-tests the connection mode before
             // acting on it, because a preference turned on under Native AA and then hidden by a
             // mode change would otherwise put a blackholing tun on a USB session. The other half
             // is DummyVpnPolicy.shouldStartForSession.
-            if (VpnControl.isVpnAvailable()) {
+            if (VpnControl.isVpnAvailable() &&
+                com.andrerinas.openheadunit.utils.DummyVpnPolicy.supportsSessionVpn(Build.VERSION.SDK_INT)) {
                 items.add(SettingItem.ToggleSettingEntry(
                     stableId = "keepDummyVpnDuringSession",
                     // Through VpnControl, not R: this copy lives in the github flavor's
                     // resources so it is absent from the Play Store build entirely.
                     nameResId = VpnControl.toggleNameRes,
                     descriptionResId = VpnControl.toggleDescriptionRes,
-                    isChecked = settings.keepDummyVpnDuringSession,
+                    isChecked = pendingKeepDummyVpnDuringSession ?: settings.keepDummyVpnDuringSession,
                     searchKeywords = "vpn offline tun stutter dropout audio video 2.4 ghz network scan",
                     onCheckedChanged = { isChecked ->
                         if (!isChecked) {
-                            settings.keepDummyVpnDuringSession = false
+                            pendingKeepDummyVpnDuringSession = false
+                            checkChanges()
                             updateSettingsList()
                         } else {
                             // Null once this app is already the prepared VPN app, which is the
                             // state AapService needs to start it with no Activity.
                             val consent = VpnControl.consentIntent(requireContext())
                             if (consent == null) {
-                                settings.keepDummyVpnDuringSession = true
+                                pendingKeepDummyVpnDuringSession = true
+                                checkChanges()
                                 updateSettingsList()
                             } else {
-                                pendingKeepDummyVpn = true
+                                vpnConsentRequested = true
                                 vpnConsentLauncher.launch(consent)
                             }
                         }
                     }
                 ))
             }
+        }
+
+        // Only where FYT's blink daemon relays the BLINK module's Android Auto channel. Needs root.
+        val blinkEnabled = pendingExternalBtBlinkTransport ?: settings.externalBtBlinkTransport
+        if (ExternalBtTransportPolicy.showBlinkToggle(BluetoothHelper.fytModuleEvidence, blinkEnabled)) {
+            items.add(SettingItem.ToggleSettingEntry(
+                stableId = "externalBtBlinkTransport",
+                nameResId = R.string.external_bt_blink_transport,
+                descriptionResId = R.string.external_bt_blink_transport_description,
+                isChecked = blinkEnabled,
+                searchKeywords = "fyt blink duduauto dudu carlink external bluetooth module transport auto_serial",
+                onCheckedChanged = { isChecked ->
+                    pendingExternalBtBlinkTransport = isChecked
+                    checkChanges()
+                    updateSettingsList()
+                }
+            ))
+        }
+
+        // Offer the existing ZBT override for known external modules and firmware candidates.
+        // A candidate may have a usable Android adapter; failed discovery alone does not refuse it.
+        //
+        // Deliberately outside the Native AA block: the reporters who need this are on units where
+        // that mode does not work, so requiring them to select it first would hide the diagnostic
+        // behind the very setting it is diagnosing.
+        // Not on FYT module units, which have no ZLink daemon; the route refuses ZBT there anyway.
+        // Still shown while on, so a toggle left over from before can be turned off.
+        val zbtChecked = pendingExternalBtZbtTransport ?: settings.externalBtZbtTransport
+        val zbtDiscovery = ZbtDiscovery.snapshot()
+        if (zbtDiscovery.decision.available &&
+            (BluetoothHelper.fytModuleEvidence == null || zbtChecked)) {
+            items.add(SettingItem.ToggleSettingEntry(
+                stableId = "externalBtZbtTransport",
+                nameResId = R.string.external_bt_transport,
+                descriptionResId = if (zbtDiscovery.decision.requiresIdentity)
+                    R.string.external_bt_candidate_transport_description else R.string.external_bt_transport_description,
+                isChecked = pendingExternalBtZbtTransport ?: settings.externalBtZbtTransport,
+                searchKeywords = "zbt zlink external bluetooth module transport handshake vendor daemon",
+                onCheckedChanged = { isChecked ->
+                    pendingExternalBtZbtTransport = isChecked
+                    checkChanges()
+                    updateSettingsList()
+                }
+            ))
+
+            items.add(SettingItem.SettingEntry(
+                stableId = "zbtProbe",
+                nameResId = R.string.zbt_probe_title,
+                value = zbtProbeResult ?: getString(R.string.zbt_probe_idle),
+                searchKeywords = "zbt zlink external bluetooth module probe test vendor daemon rfcomm",
+                onClick = { _ -> confirmAndRunZbtProbe() }
+            ))
         }
 
         // Sub-setting for Headunit Server (Manual vs Auto)
@@ -1167,14 +1411,15 @@ class SettingsFragment : Fragment() {
         // Sub-setting for Wireless Helper Strategy
         if (pendingWifiConnectionMode == WifiLauncherMode.HELPER) {
             val helperStrategies = resources.getStringArray(R.array.helper_strategies)
+            val currentStrategyId = pendingHelperConnectionStrategy?.id ?: settings.helperConnectionStrategy.id
             items.add(SettingItem.SettingEntry(
                 stableId = "helperStrategy",
                 nameResId = R.string.helper_strategy_label,
-                value = helperStrategies.getOrElse(pendingHelperConnectionStrategy!!.id) { "" },
+                value = helperStrategies.getOrElse(currentStrategyId) { "" },
                 onClick = {
                     MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
                         .setTitle(R.string.helper_strategy_label)
-                        .setSingleChoiceItems(helperStrategies, pendingHelperConnectionStrategy!!.id) { dialog, which ->
+                        .setSingleChoiceItems(helperStrategies, currentStrategyId) { dialog, which ->
                             pendingHelperConnectionStrategy = HelperStrategy.byIdOrDefault(which)
                             checkChanges()
                             dialog.dismiss()
@@ -1190,6 +1435,9 @@ class SettingsFragment : Fragment() {
                 // Strategy 4 reaches the same HotspotManager sweep as the Native AA hotspot
                 // transport, so the band choice applies here too and would otherwise be invisible.
                 addHotspotBandSetting(items)
+                if (pendingHotspotBandPreference() != HotspotBandPreference.FORCE_2_4GHZ) {
+                    addFiveGhzChannelSetting(items)
+                }
             }
 
             if (pendingHelperConnectionStrategy == HelperStrategy.WIFI_DIRECT) { // WiFi Direct (P2P)
@@ -1238,28 +1486,42 @@ class SettingsFragment : Fragment() {
         if (pendingWifiConnectionMode == WifiLauncherMode.NATIVE ||
             (pendingWifiConnectionMode == WifiLauncherMode.HELPER && pendingHelperConnectionStrategy == HelperStrategy.WIFI_DIRECT)
         ) {
-            val bssid = pendingStaticBSSID
+            // One row, not two. An access point and a P2P group are different interfaces and keep
+            // separate addresses, but only one of them is ever in force, so the row edits the one
+            // the selected transport announces and the dialog's message says which. The title is
+            // fixed because the banner's remedy deep-links by searching for it.
+            val forP2p = pendingWifiConnectionMode == WifiLauncherMode.HELPER ||
+                pendingNativeTransport() == NativeTransport.WIFI_DIRECT
+            val bssid = if (forP2p) pendingStaticP2pBSSID else pendingStaticBSSID
             items.add(SettingItem.SettingEntry(
                 stableId = "staticBSSID",
                 nameResId = R.string.static_bssid_title,
+                searchKeywords = "bssid mac address wifi direct group access point hotspot",
                 value = if (bssid == "0" || bssid == null) getString(R.string.auto) else bssid,
                 onClick = { _ ->
-                    DialogUtils.showTextInputDialog(
+                    DialogUtils.showTextInputDialogWithMessage(
                         requireContext(),
-                        R.string.static_bssid_enter_value,
+                        R.string.static_bssid_title,
+                        if (forP2p) R.string.static_p2p_bssid_desc else R.string.static_bssid_desc,
                         if (bssid == "0" || bssid == null) "" else bssid,
                         { newVal ->
-                            val trimmed = newVal?.trim().orEmpty()
+                            val trimmed = newVal.trim()
                             // Validated here rather than accepted and dealt with later. A value that is
                             // not MAC-shaped still beats every automatic source, so it does not fail at
                             // entry — it fails 30 s into a connection with a message about location
                             // services, which is the wrong thing to send somebody looking for.
-                            when {
-                                trimmed.isEmpty() -> pendingStaticBSSID = "0"
-                                SoftApBssidPolicy.isUsable(trimmed) -> pendingStaticBSSID = trimmed
-                                else -> Toast.makeText(
-                                    requireContext(), R.string.preflight_invalid_bssid, Toast.LENGTH_LONG
-                                ).show()
+                            val stored = when {
+                                trimmed.isEmpty() -> "0"
+                                SoftApBssidPolicy.isUsable(trimmed) -> trimmed
+                                else -> {
+                                    ToastUtils.showToast(
+                                        requireContext(), R.string.preflight_invalid_bssid, Toast.LENGTH_LONG, force = true
+                                    )
+                                    null
+                                }
+                            }
+                            if (stored != null) {
+                                if (forP2p) pendingStaticP2pBSSID = stored else pendingStaticBSSID = stored
                             }
                             checkChanges()
                             updateSettingsList()
@@ -1270,6 +1532,48 @@ class SettingsFragment : Fragment() {
         }
 
 
+        // Ungated, unlike the static BSSID above: this address is announced as carAddress in
+        // every connection mode, and the setup QR's own refusal deep-links here by searching for
+        // this row's title, which bypasses the Basic and Advanced tiers but not a construction gate.
+        // The checkbox trades hands-free calls for the phone's Media audio, on USB sessions only.
+        val btAddress = pendingBluetoothAddress.orEmpty()
+        val keepMediaAudio = pendingBluetoothAnnounceSkip ?: false
+        val btAddressValue = btAddress.ifEmpty { getString(R.string.not_set) }
+        items.add(SettingItem.SettingEntry(
+            stableId = "bluetoothAddress",
+            nameResId = R.string.bluetooth_address_s,
+            value = if (keepMediaAudio) "$btAddressValue · ${getString(R.string.usb_keep_phone_media_audio)}" else btAddressValue,
+            searchKeywords = "bluetooth mac address car identity hands-free calls qr usb media audio a2dp",
+            onClick = { _ ->
+                DialogUtils.showTextInputDialogWithMessage(
+                    requireContext(),
+                    R.string.enter_bluetooth_mac,
+                    R.string.bluetooth_address_message,
+                    btAddress,
+                    DialogUtils.Checkbox(
+                        R.string.usb_keep_phone_media_audio,
+                        R.string.usb_keep_phone_media_audio_description,
+                        keepMediaAudio
+                    ),
+                    { newVal, keep ->
+                        pendingBluetoothAnnounceSkip = keep
+                        // Validated at entry, for the reason the static BSSID row records: an
+                        // address that is not MAC-shaped is announced verbatim and fails much later.
+                        val trimmed = newVal.trim()
+                        when {
+                            trimmed.isEmpty() -> pendingBluetoothAddress = ""
+                            SoftApBssidPolicy.isUsable(trimmed) -> pendingBluetoothAddress = trimmed
+                            else -> ToastUtils.showToast(
+                                requireContext(), R.string.invalid_bluetooth_address, Toast.LENGTH_LONG, force = true
+                            )
+                        }
+                        checkChanges()
+                        updateSettingsList()
+                    }
+                )
+            }
+        ))
+
         // --- Automation ---
         items.add(SettingItem.CategoryHeader("automation", R.string.category_automation))
 
@@ -1279,7 +1583,8 @@ class SettingsFragment : Fragment() {
             value = getString(R.string.auto_start_settings_description),
             searchKeywords = kw(
                 R.string.auto_start_on_boot_label, R.string.auto_start_screen_on_label,
-                R.string.auto_start_usb_label, R.string.auto_start_bt_label, R.string.auto_start_wifi_label
+                R.string.auto_start_usb_label, R.string.auto_start_bt_label, R.string.auto_start_wifi_label,
+                R.string.auto_disconnect_bt_label
             ),
             onClick = {
                 try {
@@ -1303,32 +1608,37 @@ class SettingsFragment : Fragment() {
             }
         ))
 
-        items.add(SettingItem.ToggleSettingEntry(
-            stableId = "killOnDisconnect",
-            nameResId = R.string.kill_on_disconnect,
-            descriptionResId = R.string.kill_on_disconnect_description,
-            isChecked = pendingKillOnDisconnect!!,
-            onCheckedChanged = { isChecked ->
-                if (isChecked) {
-                    val conflicts = getKillOnDisconnectConflicts()
-                    val hasAutoStartOnBoot = settings.autoStartOnBoot
-                    val hasAutoStartOnScreenOn = settings.autoStartOnScreenOn
-                    if (conflicts.isNotEmpty() || hasAutoStartOnBoot || hasAutoStartOnScreenOn) {
-                        pendingKillOnDisconnect = true
-                        updateSettingsList()
-                        showKillOnDisconnectWarning(conflicts, hasAutoStartOnBoot, hasAutoStartOnScreenOn)
+        val isCarLauncherActive = (pendingEnableCarLauncher ?: settings.enableCarLauncher) ||
+            CarLauncherManager.isDefaultLauncher(requireContext())
+
+        if (!isCarLauncherActive) {
+            items.add(SettingItem.ToggleSettingEntry(
+                stableId = "killOnDisconnect",
+                nameResId = R.string.kill_on_disconnect,
+                descriptionResId = R.string.kill_on_disconnect_description,
+                isChecked = pendingKillOnDisconnect ?: settings.rawKillOnDisconnect,
+                onCheckedChanged = { isChecked ->
+                    if (isChecked) {
+                        val conflicts = getKillOnDisconnectConflicts()
+                        val hasAutoStartOnBoot = settings.autoStartOnBoot
+                        val hasAutoStartOnScreenOn = settings.autoStartOnScreenOn
+                        if (conflicts.isNotEmpty() || hasAutoStartOnBoot || hasAutoStartOnScreenOn) {
+                            pendingKillOnDisconnect = true
+                            updateSettingsList()
+                            showKillOnDisconnectWarning(conflicts, hasAutoStartOnBoot, hasAutoStartOnScreenOn)
+                        } else {
+                            pendingKillOnDisconnect = true
+                            checkChanges()
+                            updateSettingsList()
+                        }
                     } else {
-                        pendingKillOnDisconnect = true
+                        pendingKillOnDisconnect = false
                         checkChanges()
                         updateSettingsList()
                     }
-                } else {
-                    pendingKillOnDisconnect = false
-                    checkChanges()
-                    updateSettingsList()
                 }
-            }
-        ))
+            ))
+        }
 
         // Self Mode is the only mode where the phone's call screen and the projection share a
         // screen, so it is the only mode this can do anything in.
@@ -1337,7 +1647,7 @@ class SettingsFragment : Fragment() {
                 stableId = "raiseProjectionDuringCall",
                 nameResId = R.string.raise_projection_during_call,
                 descriptionResId = R.string.raise_projection_during_call_description,
-                isChecked = pendingRaiseProjectionDuringCall!!,
+                isChecked = pendingRaiseProjectionDuringCall ?: settings.raiseProjectionDuringCall,
                 onCheckedChanged = { isChecked ->
                     pendingRaiseProjectionDuringCall = isChecked
                     checkChanges()
@@ -1346,7 +1656,193 @@ class SettingsFragment : Fragment() {
             ))
         }
 
+        // --- More Features Settings ---
+        items.add(SettingItem.CategoryHeader("moreFeatures", R.string.category_more_features))
+
+        items.add(SettingItem.SettingEntry(
+            stableId = "deviceSpecificSettings",
+            nameResId = R.string.device_specific_settings,
+            value = getString(R.string.device_specific_settings_description),
+            searchKeywords = "head unit model Adayo Haval reverse gear MCU",
+            onClick = {
+                findNavController().navigate(R.id.action_settingsFragment_to_deviceSpecificSettingsFragment)
+            }
+        ))
+
+        val isCarLauncherEnabled = pendingEnableCarLauncher ?: settings.enableCarLauncher
+
+        items.add(SettingItem.ToggleSettingEntry(
+            stableId = "enableCarLauncher",
+            nameResId = R.string.pref_enable_car_launcher_title,
+            descriptionResId = R.string.pref_enable_car_launcher_summary,
+            isChecked = isCarLauncherEnabled,
+            onCheckedChanged = { isChecked ->
+                pendingEnableCarLauncher = isChecked
+                CarLauncherManager.setLauncherEnabled(requireContext(), isChecked)
+                if (isChecked && !CarLauncherManager.isDefaultLauncher(requireContext())) {
+                    CarLauncherManager.promptSetDefaultLauncher(requireContext(), homeRoleLauncher)
+                }
+                checkChanges()
+                updateSettingsList()
+            }
+        ))
+
+        if (isCarLauncherEnabled) {
+            val isDefault = CarLauncherManager.isDefaultLauncher(requireContext())
+            items.add(SettingItem.SettingEntry(
+                stableId = "setDefaultLauncher",
+                nameResId = R.string.pref_set_default_launcher_title,
+                value = getString(if (isDefault) R.string.pref_default_launcher_status_active else R.string.pref_default_launcher_status_inactive),
+                onClick = {
+                    CarLauncherManager.promptSetDefaultLauncher(requireContext(), homeRoleLauncher)
+                }
+            ))
+        }
+
+        val isFloatingButtonEnabled = pendingEnableFloatingButton ?: settings.enableFloatingButton
+
+        items.add(SettingItem.ToggleSettingEntry(
+            stableId = "enableFloatingButton",
+            nameResId = R.string.pref_enable_floating_button_title,
+            descriptionResId = R.string.pref_enable_floating_button_summary,
+            isChecked = isFloatingButtonEnabled,
+            onCheckedChanged = { isChecked ->
+                pendingEnableFloatingButton = isChecked
+                if (isChecked) {
+                    FloatingButtonManager.requestOverlayPermission(requireContext())
+                }
+                checkChanges()
+                updateSettingsList()
+            }
+        ))
+
+        if (isFloatingButtonEnabled) {
+            val connectionStatusMode = pendingFloatingButtonConnectionStatusMode ?: settings.floatingButtonConnectionStatusMode
+            items.add(SettingItem.ToggleSettingEntry(
+                stableId = "floatingButtonConnectionStatusMode",
+                nameResId = R.string.pref_floating_button_connection_status_title,
+                descriptionResId = R.string.pref_floating_button_connection_status_summary,
+                isChecked = connectionStatusMode,
+                onCheckedChanged = { isChecked ->
+                    pendingFloatingButtonConnectionStatusMode = isChecked
+                    checkChanges()
+                }
+            ))
+            val size = pendingFloatingButtonSizeDp ?: settings.floatingButtonSizeDp
+            items.add(SettingItem.SliderSettingEntry(
+                stableId = "floatingButtonSizeDp",
+                nameResId = R.string.pref_floating_button_size_title,
+                value = "${size}dp",
+                sliderValue = size.toFloat(),
+                valueFrom = 32f,
+                valueTo = 120f,
+                stepSize = 1f,
+                onValueChanged = { newVal ->
+                    pendingFloatingButtonSizeDp = newVal.toInt()
+                    checkChanges()
+                }
+            ))
+
+            val opacity = pendingFloatingButtonOpacityPercent ?: settings.floatingButtonOpacityPercent
+            items.add(SettingItem.SliderSettingEntry(
+                stableId = "floatingButtonOpacityPercent",
+                nameResId = R.string.pref_floating_button_opacity_title,
+                value = "${opacity}%",
+                sliderValue = opacity.toFloat(),
+                valueFrom = 10f,
+                valueTo = 100f,
+                stepSize = 5f,
+                onValueChanged = { newVal ->
+                    pendingFloatingButtonOpacityPercent = newVal.toInt()
+                    checkChanges()
+                }
+            ))
+
+            if (connectionStatusMode) {
+                val disconnectedOpacity = pendingFloatingButtonDisconnectedOpacityPercent ?: settings.floatingButtonDisconnectedOpacityPercent
+                items.add(SettingItem.SliderSettingEntry(
+                    stableId = "floatingButtonDisconnectedOpacityPercent",
+                    nameResId = R.string.pref_floating_button_disconnected_opacity_title,
+                    value = "${disconnectedOpacity}%",
+                    sliderValue = disconnectedOpacity.toFloat(),
+                    valueFrom = 0f,
+                    valueTo = 100f,
+                    stepSize = 5f,
+                    onValueChanged = { newVal ->
+                        pendingFloatingButtonDisconnectedOpacityPercent = newVal.toInt()
+                        checkChanges()
+                    }
+                ))
+            }
+
+            val xPos = pendingFloatingButtonXPercent ?: settings.floatingButtonXPercent
+            items.add(SettingItem.SliderSettingEntry(
+                stableId = "floatingButtonXPercent",
+                nameResId = R.string.pref_floating_button_x_title,
+                value = "${xPos}%",
+                sliderValue = xPos.toFloat(),
+                valueFrom = 0f,
+                valueTo = 100f,
+                stepSize = 1f,
+                onValueChanged = { newVal ->
+                    pendingFloatingButtonXPercent = newVal.toInt()
+                    checkChanges()
+                }
+            ))
+
+            val yPos = pendingFloatingButtonYPercent ?: settings.floatingButtonYPercent
+            items.add(SettingItem.SliderSettingEntry(
+                stableId = "floatingButtonYPercent",
+                nameResId = R.string.pref_floating_button_y_title,
+                value = "${yPos}%",
+                sliderValue = yPos.toFloat(),
+                valueFrom = 0f,
+                valueTo = 100f,
+                stepSize = 1f,
+                onValueChanged = { newVal ->
+                    pendingFloatingButtonYPercent = newVal.toInt()
+                    checkChanges()
+                }
+            ))
+        }
+
+        if (!isCarLauncherActive) {
+            val exitActions = arrayOf(
+                getString(R.string.aa_exit_action_oem_launcher),
+                getString(R.string.aa_exit_action_app_home),
+                getString(R.string.aa_exit_action_disconnect)
+            )
+            val currentExitActionIdx = (pendingAaExitAction ?: settings.rawAaExitAction).value
+            items.add(SettingItem.SettingEntry(
+                stableId = "aaExitAction",
+                nameResId = R.string.pref_aa_exit_action_title,
+                value = exitActions.getOrElse(currentExitActionIdx) { exitActions[0] },
+                searchKeywords = getString(R.string.pref_aa_exit_action_summary),
+                onClick = { _ ->
+                    MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+                        .setTitle(R.string.pref_aa_exit_action_title)
+                        .setSingleChoiceItems(exitActions, currentExitActionIdx) { dialog, which ->
+                            Settings.ExitAction.fromInt(which)?.let { pendingAaExitAction = it }
+                            checkChanges()
+                            dialog.dismiss()
+                            updateSettingsList()
+                        }
+                        .show()
+                }
+            ))
+        }
+
         // --- Navigation Settings ---
+                items.add(SettingItem.SettingEntry(
+            stableId = "oemAppManagement",
+            nameResId = R.string.oem_app_management,
+            value = if (pendingAutoKillOemApps ?: settings.autoKillOemApps) getString(R.string.oem_app_autokill_enabled) else getString(R.string.oem_app_management_desc),
+            searchKeywords = "zlink autokit speedplay tlink carplay adb root oem conflict kill stop disable",
+            onClick = {
+                showOemAppManagementDialog()
+            }
+        ))
+
         items.add(SettingItem.CategoryHeader("navigation", R.string.category_navigation))
 
         // The GPS source choice (this device vs the connected phone) only applies when a phone is
@@ -1356,7 +1852,7 @@ class SettingsFragment : Fragment() {
                 stableId = "gpsNavigation",
                 nameResId = R.string.gps_for_navigation,
                 descriptionResId = R.string.gps_for_navigation_description,
-                isChecked = pendingUseGps!!,
+                isChecked = pendingUseGps ?: settings.useGpsForNavigation,
                 onCheckedChanged = { isChecked ->
                     pendingUseGps = isChecked
                     checkChanges()
@@ -1369,7 +1865,7 @@ class SettingsFragment : Fragment() {
             stableId = "showNavigationNotifications",
             nameResId = R.string.show_navigation_notifications,
             descriptionResId = R.string.show_navigation_notifications_description,
-            isChecked = pendingShowNavigationNotifications!!,
+            isChecked = pendingShowNavigationNotifications ?: settings.showNavigationNotifications,
             onCheckedChanged = { isChecked ->
                 pendingShowNavigationNotifications = isChecked
                 checkChanges()
@@ -1381,7 +1877,7 @@ class SettingsFragment : Fragment() {
             stableId = "fakeSpeed",
             nameResId = R.string.fake_speed_title,
             descriptionResId = R.string.fake_speed_description,
-            isChecked = pendingFakeSpeed!!,
+            isChecked = pendingFakeSpeed ?: settings.fakeSpeed,
             onCheckedChanged = { isChecked ->
                 pendingFakeSpeed = isChecked
                 checkChanges()
@@ -1395,7 +1891,7 @@ class SettingsFragment : Fragment() {
         items.add(SettingItem.SettingEntry(
             stableId = "resolution",
             nameResId = R.string.resolution,
-            value = Settings.Resolution.fromId(pendingResolution!!)?.resName ?: "",
+            value = Settings.Resolution.fromId(pendingResolution ?: settings.resolutionId)?.resName ?: "",
             searchKeywords = Settings.Resolution.allRes.joinToString(" "),
             onClick = { showResolutionDialog() }
         ))
@@ -1403,7 +1899,7 @@ class SettingsFragment : Fragment() {
         items.add(SettingItem.SettingEntry(
             stableId = "dpiPixelDensity",
             nameResId = R.string.dpi,
-            value = if (pendingDpi == 0) getString(R.string.auto) else pendingDpi.toString(),
+            value = dpiRowValue(),
             onClick = {
                 try {
                     findNavController().navigate(R.id.action_settingsFragment_to_dpiSettingsFragment)
@@ -1423,7 +1919,7 @@ class SettingsFragment : Fragment() {
                 showNumericInputDialog(
                     title = getString(R.string.enter_pixel_aspect_ratio_value),
                     message = null,
-                    initialValue = if ((pendingPixelAspectRatioE4 ?: 10000) <= 0) 10000 else pendingPixelAspectRatioE4!!,
+                    initialValue = if ((pendingPixelAspectRatioE4 ?: 10000) <= 0) 10000 else (pendingPixelAspectRatioE4 ?: 10000),
                     onConfirm = { newVal ->
                         pendingPixelAspectRatioE4 = if (newVal <= 0) 10000 else newVal
                         checkChanges()
@@ -1493,11 +1989,11 @@ class SettingsFragment : Fragment() {
             },
             onClick = { _ ->
                 val viewModes = arrayOf(getString(R.string.surface_view), getString(R.string.texture_view), getString(R.string.gles_view))
-                val currentIdx = pendingViewMode!!.value
+                val currentIdx = pendingViewMode?.value ?: settings.viewMode.value
                 MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
                     .setTitle(R.string.change_view_mode)
                     .setSingleChoiceItems(viewModes, currentIdx) { dialog, which ->
-                        pendingViewMode = Settings.ViewMode.fromInt(which)!!
+                        Settings.ViewMode.fromInt(which)?.let { pendingViewMode = it }
                         checkChanges()
                         dialog.dismiss()
                         updateSettingsList()
@@ -1506,14 +2002,15 @@ class SettingsFragment : Fragment() {
             }
         ))
 
+        val orientationOptions = resources.getStringArray(R.array.screen_orientation)
+        val currentOrientationIdx = pendingScreenOrientation?.value ?: settings.screenOrientation.value
         items.add(SettingItem.SettingEntry(
             stableId = "screenOrientation",
             nameResId = R.string.screen_orientation,
-            value = resources.getStringArray(R.array.screen_orientation)[pendingScreenOrientation!!.value],
-            searchKeywords = resources.getStringArray(R.array.screen_orientation).joinToString(" "),
+            value = orientationOptions.getOrElse(currentOrientationIdx) { "" },
+            searchKeywords = orientationOptions.joinToString(" "),
             onClick = { _ ->
-                val orientationOptions = resources.getStringArray(R.array.screen_orientation)
-                val currentIdx = pendingScreenOrientation!!.value
+                val currentIdx = pendingScreenOrientation?.value ?: settings.screenOrientation.value
                 MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
                     .setTitle(R.string.change_screen_orientation)
                     .setSingleChoiceItems(orientationOptions, currentIdx) { dialog, whiches ->
@@ -1537,17 +2034,24 @@ class SettingsFragment : Fragment() {
             }
         ))
 
-        // Add the toggle for Stretch to Fill
-        items.add(SettingItem.ToggleSettingEntry(
-            stableId = "stretchToFill",
-            nameResId = R.string.pref_stretch_screen_title,
-            descriptionResId = R.string.pref_stretch_screen_summary,
-            isChecked = pendingStretchToFill!!,
-            onCheckedChanged = { isChecked ->
-                pendingStretchToFill = isChecked
-                requiresRestart = true // Requires a reconnect to apply the new rendering bounds
-                checkChanges()
-                updateSettingsList()
+        // Video fit: how a mismatched-aspect video is fitted into the panel (object-fit style).
+        items.add(SettingItem.SettingEntry(
+            stableId = "videoFitMode",
+            nameResId = R.string.video_fit_mode,
+            value = resources.getStringArray(R.array.video_fit_mode)[(pendingVideoFitMode ?: settings.videoFitMode).value],
+            searchKeywords = resources.getStringArray(R.array.video_fit_mode).joinToString(" "),
+            onClick = { _ ->
+                val fitOptions = resources.getStringArray(R.array.video_fit_mode)
+                val currentIdx = (pendingVideoFitMode ?: settings.videoFitMode).value
+                MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+                    .setTitle(R.string.change_video_fit_mode)
+                    .setSingleChoiceItems(fitOptions, currentIdx) { dialog, which ->
+                        pendingVideoFitMode = Settings.VideoFitMode.fromInt(which) ?: Settings.VideoFitMode.FILL
+                        checkChanges()
+                        dialog.dismiss()
+                        updateSettingsList()
+                    }
+                    .show()
             }
         ))
 
@@ -1563,24 +2067,12 @@ class SettingsFragment : Fragment() {
             }
         ))
 
-        items.add(SettingItem.ToggleSettingEntry(
-            stableId = "useMeasuredTouchSurface",
-            nameResId = R.string.use_measured_touch_surface,
-            descriptionResId = R.string.use_measured_touch_surface_description,
-            isChecked = pendingUseMeasuredTouchSurface ?: false,
-            onCheckedChanged = { isChecked ->
-                pendingUseMeasuredTouchSurface = isChecked
-                checkChanges()
-                updateSettingsList()
-            }
-        ))
-
         if (pendingViewMode == Settings.ViewMode.SURFACE) {
             items.add(SettingItem.ToggleSettingEntry(
                 stableId = "forcedScale",
                 nameResId = R.string.forced_scale,
                 descriptionResId = R.string.forced_scale_description,
-                isChecked = pendingForcedScale!!,
+                isChecked = pendingForcedScale ?: settings.forcedScale,
                 onCheckedChanged = { isChecked ->
                     pendingForcedScale = isChecked
                     requiresRestart = true
@@ -1643,7 +2135,7 @@ class SettingsFragment : Fragment() {
             stableId = "forceSoftwareDecoding",
             nameResId = R.string.force_software_decoding,
             descriptionResId = R.string.force_software_decoding_description,
-            isChecked = pendingForceSoftware!!,
+            isChecked = pendingForceSoftware ?: settings.forceSoftwareDecoding,
             onCheckedChanged = { isChecked ->
                 pendingForceSoftware = isChecked
                 checkChanges()
@@ -1686,7 +2178,7 @@ class SettingsFragment : Fragment() {
         items.add(SettingItem.SettingEntry(
             stableId = "videoCodec",
             nameResId = R.string.video_codec,
-            value = pendingVideoCodec!!,
+            value = pendingVideoCodec ?: settings.videoCodec,
             searchKeywords = "Auto H.264 H.265",
             onClick = { _ ->
                 val codecs = arrayOf("Auto", "H.264", "H.265")
@@ -1722,17 +2214,31 @@ class SettingsFragment : Fragment() {
             }
         ))
 
-        // Applied immediately rather than on confirm, unlike the rows above it: the configure
-        // ladder falls back on its own if the decoder rejects the key, so there is nothing to
-        // weigh up before trying it.
+        // Beside the two rows it overrides, because that is where a user looking at 1080p/60 and
+        // not getting it will come looking.
+        items.add(SettingItem.ToggleSettingEntry(
+            stableId = "narrowBandProfileCap",
+            nameResId = R.string.narrow_band_profile_cap,
+            descriptionResId = R.string.narrow_band_profile_cap_description,
+            isChecked = pendingNarrowBandProfileCap ?: settings.narrowBandProfileCap,
+            searchKeywords = "2.4 GHz band resolution fps limit hotspot wifi direct video",
+            onCheckedChanged = { isChecked ->
+                pendingNarrowBandProfileCap = isChecked
+                checkChanges()
+                updateSettingsList()
+            }
+        ))
+
+        // Safe to try: the configure ladder falls back on its own if the decoder rejects the key.
         items.add(SettingItem.ToggleSettingEntry(
             stableId = "debugVideoLowLatency",
             nameResId = R.string.debug_video_low_latency,
             descriptionResId = R.string.debug_video_low_latency_description,
-            isChecked = settings.debugVideoLowLatency,
+            isChecked = pendingDebugVideoLowLatency ?: settings.debugVideoLowLatency,
             searchKeywords = "low latency vendor key decoder mediatek amlogic qualcomm exynos",
             onCheckedChanged = { isChecked ->
-                settings.debugVideoLowLatency = isChecked
+                pendingDebugVideoLowLatency = isChecked
+                checkChanges()
                 updateSettingsList()
             }
         ))
@@ -1815,7 +2321,7 @@ class SettingsFragment : Fragment() {
             stableId = "enableAudioSink",
             nameResId = R.string.enable_audio_sink,
             descriptionResId = R.string.enable_audio_sink_description,
-            isChecked = pendingEnableAudioSink!!,
+            isChecked = pendingEnableAudioSink ?: settings.enableAudioSink,
             onCheckedChanged = { isChecked ->
                 pendingEnableAudioSink = isChecked
                 checkChanges()
@@ -1895,11 +2401,25 @@ class SettingsFragment : Fragment() {
             }
         ))
 
+        if (Build.VERSION.SDK_INT >= 26) {
+            items.add(SettingItem.ToggleSettingEntry(
+                stableId = "useAAudioOutput",
+                nameResId = R.string.aaudio_output,
+                descriptionResId = R.string.aaudio_output_description,
+                isChecked = pendingUseAAudioOutput ?: settings.useAAudioOutput,
+                onCheckedChanged = { isChecked ->
+                    pendingUseAAudioOutput = isChecked
+                    checkChanges()
+                    updateSettingsList()
+                }
+            ))
+        }
+
         items.add(SettingItem.ToggleSettingEntry(
             stableId = "useAacAudio",
             nameResId = R.string.use_aac_audio,
             descriptionResId = R.string.use_aac_audio_description,
-            isChecked = pendingUseAacAudio!!,
+            isChecked = pendingUseAacAudio ?: settings.useAacAudio,
             onCheckedChanged = { isChecked ->
                 pendingUseAacAudio = isChecked
                 checkChanges()
@@ -1924,9 +2444,21 @@ class SettingsFragment : Fragment() {
             stableId = "syncMediaSessionAaMetadata",
             nameResId = R.string.sync_media_session_aa_metadata,
             descriptionResId = R.string.sync_media_session_aa_metadata_description,
-            isChecked = pendingSyncMediaSessionAaMetadata!!,
+            isChecked = pendingSyncMediaSessionAaMetadata ?: settings.syncMediaSessionWithAaMetadata,
             onCheckedChanged = { isChecked ->
                 pendingSyncMediaSessionAaMetadata = isChecked
+                checkChanges()
+                updateSettingsList()
+            }
+        ))
+
+        items.add(SettingItem.ToggleSettingEntry(
+            stableId = "autoResumePlaybackOnReconnect",
+            nameResId = R.string.auto_resume_playback_on_reconnect,
+            descriptionResId = R.string.auto_resume_playback_on_reconnect_description,
+            isChecked = pendingAutoResumePlaybackOnReconnect ?: settings.autoResumePlaybackOnReconnect,
+            onCheckedChanged = { isChecked ->
+                pendingAutoResumePlaybackOnReconnect = isChecked
                 checkChanges()
                 updateSettingsList()
             }
@@ -1951,14 +2483,52 @@ class SettingsFragment : Fragment() {
             }
         ))
 
+        val matchingModes = com.andrerinas.openheadunit.decoder.audio.AudioTimeCorrectionMode.entries
+        val matchingLabels = arrayOf(getString(R.string.audio_matching_ohu), getString(R.string.audio_matching_wsola),
+            getString(R.string.audio_matching_phase_vocoder), getString(R.string.audio_matching_phase_vocoder_short),
+            getString(R.string.audio_matching_phase_gradient))
+        val matchingIndex = matchingModes.indexOf(pendingAudioTimeCorrectionMode ?: settings.audioMatchingMode)
+        items.add(SettingItem.SettingEntry(
+            stableId = "audioMatchingMode",
+            nameResId = R.string.audio_matching_mode,
+            value = matchingLabels[matchingIndex],
+            searchKeywords = kw(R.string.audio_matching_ohu, R.string.audio_matching_wsola, R.string.audio_matching_phase_vocoder, R.string.audio_matching_phase_vocoder_short, R.string.audio_matching_phase_gradient),
+            onClick = {
+                val builder = AlertDialog.Builder(requireContext())
+                val hints = intArrayOf(R.string.audio_matching_ohu_hint, R.string.audio_matching_wsola_hint,
+                    R.string.audio_matching_phase_vocoder_hint, R.string.audio_matching_phase_vocoder_short_hint,
+                    R.string.audio_matching_phase_gradient_hint)
+                val options = matchingLabels.mapIndexed { index, label ->
+                    getString(R.string.audio_matching_option, label, getString(hints[index]))
+                }
+                val adapter = ArrayAdapter(
+                    builder.context, R.layout.item_audio_matching_choice, options
+                )
+                builder.setTitle(R.string.audio_matching_mode)
+                    .setSingleChoiceItems(adapter, matchingIndex) { dialog, which ->
+                        pendingAudioTimeCorrectionMode = matchingModes[which]
+                        checkChanges()
+                        dialog.dismiss()
+                        updateSettingsList()
+                    }.show()
+            }
+        ))
+        items.add(SettingItem.InfoBanner(
+            stableId = "audioMatchingModeHint",
+            textResId = R.string.audio_matching_description
+        ))
+
         items.add(SettingItem.SettingEntry(
             stableId = "audioLatencyMultiplier",
             nameResId = R.string.audio_latency_multiplier,
             value = "${pendingAudioLatencyMultiplier}x",
             onClick = { _ ->
-                val options = arrayOf("1x (Lowest Latency)", "2x (Low Latency)", "4x (High Latency)", "8x (Very High Latency)")
-                val values = intArrayOf(1, 2, 4, 8)
-                val currentIndex = values.indexOf(pendingAudioLatencyMultiplier ?: 8).coerceAtLeast(0)
+                val options = arrayOf(
+                    "1x (lowest latency)", "2x (low latency)", "4x (medium)",
+                    "8x (deep)", "16x (deepest, default)"
+                )
+                val values = intArrayOf(1, 2, 4, 8, 16)
+                val currentIndex = values.indexOf(pendingAudioLatencyMultiplier ?: com.andrerinas.openheadunit.decoder.audio.AudioJitterBufferPolicy.DEFAULT_MULTIPLIER).coerceAtLeast(0)
                 AlertDialog.Builder(requireContext())
                     .setTitle(R.string.audio_latency_multiplier)
                     .setSingleChoiceItems(options, currentIndex) { dialog, which ->
@@ -2074,15 +2644,33 @@ class SettingsFragment : Fragment() {
         // --- Debug Settings ---
         items.add(SettingItem.CategoryHeader("debug", R.string.category_debug))
 
-        items.add(SettingItem.ToggleSettingEntry(
-            stableId = "showFpsCounter",
-            nameResId = R.string.show_fps_counter,
-            descriptionResId = R.string.show_fps_counter_description,
-            isChecked = pendingShowFpsCounter!!,
-            onCheckedChanged = { isChecked ->
-                pendingShowFpsCounter = isChecked
-                checkChanges()
-                updateSettingsList()
+        val overlayLabels = mapOf(
+            PerformanceOverlayField.FPS to getString(R.string.overlay_field_fps),
+            PerformanceOverlayField.CPU to getString(R.string.overlay_field_cpu),
+            PerformanceOverlayField.TEMP to getString(R.string.overlay_field_temperature),
+            PerformanceOverlayField.FRAME to getString(R.string.overlay_field_frame_age),
+            PerformanceOverlayField.BATTERY to getString(R.string.overlay_field_battery),
+            PerformanceOverlayField.MEMORY to getString(R.string.overlay_field_memory),
+            PerformanceOverlayField.WIFI to getString(R.string.overlay_field_wifi_signal)
+        )
+        items.add(SettingItem.SettingEntry(
+            stableId = "performanceOverlay",
+            nameResId = R.string.performance_overlay_settings,
+            value = PerformanceOverlayPolicy.entrySummary(
+                settings.showPerformanceOverlay,
+                settings.overlayFields,
+                overlayLabels,
+                getString(R.string.appearance_off),
+                getString(R.string.performance_overlay_no_lines),
+                getString(if (settings.overlayPosition == Settings.OverlayPosition.RIGHT) R.string.margin_right else R.string.margin_left).lowercase()
+            ),
+            searchKeywords = kw(
+                R.string.overlay_field_fps, R.string.overlay_field_cpu, R.string.overlay_field_temperature,
+                R.string.overlay_field_frame_age, R.string.overlay_field_battery, R.string.overlay_field_memory,
+                R.string.overlay_field_wifi_signal, R.string.overlay_position
+            ),
+            onClick = {
+                findNavController().navigate(R.id.action_settingsFragment_to_performanceOverlaySettingsFragment)
             }
         ))
 
@@ -2202,6 +2790,21 @@ class SettingsFragment : Fragment() {
             ))
         }
 
+        // Sits beside the log settings because those are half of what it unlocks: with this off,
+        // another app can still connect and disconnect, but cannot rewrite this unit's setup or
+        // drive the capture.
+        items.add(SettingItem.ToggleSettingEntry(
+            stableId = "allowExternalConfiguration",
+            nameResId = R.string.allow_external_configuration,
+            descriptionResId = R.string.allow_external_configuration_description,
+            isChecked = pendingAllowExternalConfiguration ?: settings.allowExternalConfiguration,
+            onCheckedChanged = { isChecked ->
+                pendingAllowExternalConfiguration = isChecked
+                checkChanges()
+                updateSettingsList()
+            }
+        ))
+
         val logLevels = LogExporter.LogLevel.entries
         val logLevelNames = logLevels.map { it.name.lowercase().replaceFirstChar { c -> c.uppercase() } }.toTypedArray()
         items.add(SettingItem.SettingEntry(
@@ -2315,7 +2918,7 @@ class SettingsFragment : Fragment() {
                 val context = requireContext()
                 val exporterLevel = settings.exporterLogLevel
                 if (exporterLevel == LogExporter.LogLevel.SILENT) {
-                    Toast.makeText(context, getString(R.string.start_log_capture_in_silent), Toast.LENGTH_LONG).show()
+                    ToastUtils.showToast(context, getString(R.string.start_log_capture_in_silent), Toast.LENGTH_LONG, force = true)
                     return@SettingEntry
                 }
 
@@ -2347,7 +2950,7 @@ class SettingsFragment : Fragment() {
                 val context = requireContext()
                 val exporterLevel = settings.exporterLogLevel
                 if (exporterLevel == LogExporter.LogLevel.SILENT) {
-                    Toast.makeText(context, getString(R.string.failed_export_in_silent_logs), Toast.LENGTH_LONG).show()
+                    ToastUtils.showToast(context, getString(R.string.failed_export_in_silent_logs), Toast.LENGTH_LONG, force = true)
                     return@SettingEntry
                 }
 
@@ -2377,7 +2980,7 @@ class SettingsFragment : Fragment() {
                             }
                             .show()
                     } else {
-                        Toast.makeText(context, getString(R.string.failed_export_logs), Toast.LENGTH_SHORT).show()
+                        ToastUtils.showToast(context, getString(R.string.failed_export_logs), Toast.LENGTH_SHORT, force = true)
                     }
                 }
             }
@@ -2391,6 +2994,15 @@ class SettingsFragment : Fragment() {
             nameResId = R.string.version,
             value = BuildConfig.VERSION_NAME,
             onClick = { /* Read only */ }
+        ))
+
+        items.add(SettingItem.SettingEntry(
+            stableId = "check_for_updates",
+            nameResId = R.string.check_for_updates,
+            value = getString(R.string.check_for_updates_description),
+            onClick = {
+                handleCheckForUpdates()
+            }
         ))
 
         items.add(SettingItem.SettingEntry(
@@ -2432,36 +3044,24 @@ class SettingsFragment : Fragment() {
         renderSettings(scrollState)
     }
 
-    private fun setupTabsAndSearch(view: View) {
-        settingsTabGroup = view.findViewById(R.id.settingsTabGroup)
-        searchInput = view.findViewById(R.id.settingsSearch)
-
-        settingsTabGroup?.check(if (pendingAdvancedSettings == false) R.id.tabBasic else R.id.tabAdvanced)
-        settingsTabGroup?.addOnButtonCheckedListener { _, checkedId, isChecked ->
-            if (!isChecked) return@addOnButtonCheckedListener
-            pendingAdvancedSettings = (checkedId == R.id.tabAdvanced)
-            checkChanges()
-            renderSettings()
-        }
-
-        searchInput?.addTextChangedListener(object : android.text.TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, count: Int, before: Int) {}
-            override fun afterTextChanged(s: android.text.Editable?) {
-                searchQuery = s?.toString() ?: ""
+    private fun setupHeader(view: View) {
+        header = SettingsHeaderController(
+            root = view,
+            advanced = settings.isAdvancedSettingsActive,
+            onBack = { handleBackPress() },
+            onReset = { startResetSettings() },
+            onSave = { saveSettings() },
+            // The tier is a view choice and saves at once, so it never counts as an unsaved change.
+            onTierChanged = { advanced ->
+                if (advanced != settings.isAdvancedSettingsActive) settings.isAdvancedSettingsActive = advanced
+                renderSettings()
+            },
+            onQueryChanged = { query ->
+                searchQuery = query
                 renderSettings()
             }
-        })
-
-        // The clear (X) icon also lowers the keyboard and drops focus. Some Chinese head units
-        // cannot dismiss the keyboard easily once it is open, so give an explicit way out.
-        view.findViewById<com.google.android.material.textfield.TextInputLayout>(R.id.settingsSearchLayout)
-            ?.setEndIconOnClickListener {
-                searchInput?.setText("")
-                searchInput?.clearFocus()
-                hideKeyboard(view)
-            }
-
+        )
+        updateSaveButtonState()
         applyRequestedSearchQuery()
     }
 
@@ -2478,10 +3078,7 @@ class SettingsFragment : Fragment() {
         val query = intent.getStringExtra(SettingsActivity.EXTRA_SEARCH_QUERY)
         if (query.isNullOrBlank()) return
         intent.removeExtra(SettingsActivity.EXTRA_SEARCH_QUERY)
-        searchInput?.setText(query)
-        // Focus would open the keyboard over the very rows we just filtered to, which on a short
-        // head unit panel is the whole list.
-        searchInput?.clearFocus()
+        header?.showQuery(query)
     }
 
     private fun hideKeyboard(view: View) {
@@ -2497,91 +3094,65 @@ class SettingsFragment : Fragment() {
 
     private fun renderSettings(scrollState: android.os.Parcelable? = null) {
         // While searching, the tab has no effect (search spans both tiers), so hint that.
-        settingsTabGroup?.isEnabled = searchQuery.isBlank()
-        settingsAdapter.submitList(filterSettings(fullSettingsList)) {
+        header?.setSearching(searchQuery.isNotBlank())
+        val noResults = SettingItem.InfoBanner(
+            stableId = "searchNoResults",
+            textResId = R.string.settings_search_no_results,
+            text = getString(R.string.settings_search_no_results, searchQuery.trim())
+        )
+        val visible = SettingsFilterPolicy.withNoResultsNote(filterSettings(fullSettingsList), searchQuery, noResults)
+        settingsAdapter.submitList(visible) {
             scrollState?.let { settingsRecyclerView.layoutManager?.onRestoreInstanceState(it) }
+            header?.submitCategories(categoriesOf(visible))
         }
     }
 
-    // Filters the full list by active tab / search query, keeping category headers only when
-    // at least one of their children survives (so no empty sections show).
-    private fun filterSettings(full: List<SettingItem>): List<SettingItem> {
-        val query = searchQuery.trim()
-        val result = mutableListOf<SettingItem>()
-        var pendingHeader: SettingItem.CategoryHeader? = null
-        var currentCategoryId: String? = null
-        var headerMatchesQuery = false
-
-        for (item in full) {
-            if (item is SettingItem.CategoryHeader) {
-                pendingHeader = item
-                currentCategoryId = item.stableId
-                headerMatchesQuery = query.isNotEmpty() &&
-                    getString(item.titleResId).contains(query, ignoreCase = true)
-                continue
-            }
-            if (shouldShowItem(item, currentCategoryId, query, headerMatchesQuery)) {
-                pendingHeader?.let { result.add(it); pendingHeader = null }
-                result.add(item)
-            }
-        }
-        return result
-    }
-
-    private fun shouldShowItem(
-        item: SettingItem,
-        categoryId: String?,
-        query: String,
-        headerMatchesQuery: Boolean
-    ): Boolean {
-        // The bottom Save action is always relevant when present.
-        if (item is SettingItem.ActionButton && item.stableId == "bottomSaveButton") return true
-
-        // Connection-type filter: hide settings that do not apply to the chosen connection,
-        // in BOTH tabs and in search. USB hides WiFi settings, WiFi hides USB settings,
-        // Self Mode hides both, All/unset show everything.
-        if (isHiddenByConnection(item, categoryId)) return false
-
-        if (query.isNotEmpty()) {
-            return headerMatchesQuery || searchableText(item).contains(query, ignoreCase = true)
+    /** The sections of the rendered list, for the category rail or chips. */
+    private fun categoriesOf(items: List<SettingItem>): List<SettingsCategory> =
+        items.mapIndexedNotNull { position, item ->
+            (item as? SettingItem.CategoryHeader)?.let { SettingsCategory(it.stableId, it.titleResId, position) }
         }
 
-        if (pendingAdvancedSettings == true) return true
-
-        return item.stableId in basicSettingIds
+    /** The note naming the settings the chosen connection types hide, or null when none are. */
+    private fun scopeNotice(): SettingItem.ScopeNotice? {
+        val notice = SettingsLayoutPolicy.scopeNotice(settings.showsUsb(), settings.showsWifi())
+        val (textResId, icon, filledIcon) = when (notice) {
+            SettingsLayoutPolicy.ScopeNotice.NONE -> return null
+            SettingsLayoutPolicy.ScopeNotice.WIFI_HIDDEN ->
+                Triple(R.string.settings_scope_wifi_hidden, R.drawable.ic_sym_usb, R.drawable.ic_sym_usb_fill)
+            SettingsLayoutPolicy.ScopeNotice.USB_HIDDEN ->
+                Triple(R.string.settings_scope_usb_hidden, R.drawable.ic_sym_wifi, R.drawable.ic_sym_wifi_fill)
+            SettingsLayoutPolicy.ScopeNotice.USB_AND_WIFI_HIDDEN ->
+                Triple(R.string.settings_scope_usb_wifi_hidden, R.drawable.ic_sym_devices, R.drawable.ic_sym_devices_fill)
+        }
+        return SettingItem.ScopeNotice(
+            stableId = "scopeNotice",
+            text = getString(textResId),
+            iconResId = icon,
+            filledIconResId = filledIcon,
+            actionResId = R.string.settings_scope_change,
+            onAction = { showConnectionModeDialog() }
+        )
     }
 
-    // Items scoped to a USB connection (the Wireless Connection category is the WiFi scope).
-    private val usbScopedIds = setOf("useLibusb")
+    // The rules live in SettingsFilterPolicy so they can be tested without the views.
+    private fun filterSettings(full: List<SettingItem>): List<SettingItem> =
+        SettingsFilterPolicy.filter(
+            items = full,
+            query = searchQuery,
+            advanced = settings.isAdvancedSettingsActive,
+            showsUsb = settings.showsUsb(),
+            showsWifi = settings.showsWifi(),
+            basicIds = basicSettingIds,
+            text = { getString(it) }
+        )
 
     // Resolutions this wide or more (1440p, 4K) are flagged as high-bandwidth.
     private val HIGH_BANDWIDTH_WIDTH = 2560
 
-    private fun isHiddenByConnection(item: SettingItem, categoryId: String?): Boolean {
-        if (categoryId == "wirelessConnection") return !settings.showsWifi()
-        if (item.stableId in usbScopedIds) return !settings.showsUsb()
-        return false
-    }
-
     // Text used for search matching (title + description/value where applicable).
     // Joins localized labels into a keyword blob for the settings search.
     private fun kw(vararg ids: Int): String = ids.joinToString(" ") { getString(it) }
-
-    private fun searchableText(item: SettingItem): String = when (item) {
-        is SettingItem.SettingEntry ->
-            "${item.nameOverride ?: getString(item.nameResId)} ${item.value} ${item.searchKeywords ?: ""}"
-        is SettingItem.ToggleSettingEntry ->
-            "${item.nameOverride ?: getString(item.nameResId)} ${if (item.descriptionResId != null) getString(item.descriptionResId) else ""} ${item.searchKeywords ?: ""}"
-        is SettingItem.StreamSettingEntry ->
-            "${getString(item.nameResId)} ${item.value} ${if (item.descriptionResId != null) getString(item.descriptionResId) else ""} ${item.searchKeywords ?: ""}"
-        is SettingItem.SliderSettingEntry ->
-            "${getString(item.nameResId)} ${item.value}"
-        is SettingItem.SegmentedButtonSettingEntry ->
-            "${getString(item.nameResId)} ${item.options.joinToString(" ")}"
-        is SettingItem.InfoBanner -> item.text ?: getString(item.textResId)
-        is SettingItem.ActionButton -> getString(item.textResId)
-        is SettingItem.CategoryHeader -> getString(item.titleResId)
-    }
 
     /** The chosen connection types as a readable label ("USB, WiFi"); empty shows all. */
     private fun connectionModesLabel(): String {
@@ -2649,6 +3220,40 @@ class SettingsFragment : Fragment() {
         updateSettingsList()
     }
 
+    /** The row shows what Android Auto receives and its dp canvas, after the margins. */
+    private fun dpiRowValue(): String {
+        val stored = pendingDpi ?: 0
+        val chosen = Settings.Resolution.fromId(pendingResolution ?: settings.resolutionId)
+        val (pw, ph) = realPanelResolution()
+        val res = if (chosen == null || chosen == Settings.Resolution.AUTO) {
+            com.andrerinas.openheadunit.utils.SystemOptimizer.recommendedResolution(pw, ph)
+        } else chosen
+        val preset = com.andrerinas.openheadunit.utils.OnboardingDisplayPolicy.initialPreset(
+            settings.displaySizePreset, com.andrerinas.openheadunit.utils.SystemOptimizer.DisplaySizePreset.SMALL_7_8
+        )
+        val portrait = com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.projectsPortrait(
+            pendingScreenOrientation ?: settings.screenOrientation
+        )
+        val (ow, oh) = com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.orientPanel(pw, ph, portrait)
+        val fit = pendingVideoFitMode ?: settings.videoFitMode
+        val (vw, vh) = com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.visibleSize(fit, ow, oh, res.width, res.height)
+        val par = com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.pixelAspectE4(
+            fit, ow, oh, res.width, res.height, pendingPixelAspectRatioE4 ?: settings.pixelAspectRatioE4
+        )
+        val d = com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.decide(
+            stored, preset, vw, vh, par, settings.dpiFloorOverride, ow, oh
+        )
+        val (sw, sh) = com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.phoneCanvas(vw, vh, par)
+        val cw = com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.canvasDp(sw, d.announced)
+        val ch = com.andrerinas.openheadunit.utils.AnnouncedDensityPolicy.canvasDp(sh, d.announced)
+        return when {
+            res.width <= 0 -> if (stored == 0) getString(R.string.auto) else stored.toString()
+            stored == 0 -> getString(R.string.dpi_row_auto_format, d.announced, cw, ch)
+            d.announced != stored -> getString(R.string.dpi_row_clamped_format, stored, d.announced, cw, ch)
+            else -> getString(R.string.dpi_row_value_format, stored, cw, ch)
+        }
+    }
+
     private fun realPanelResolution(): Pair<Int, Int> {
         val m = android.util.DisplayMetrics()
         try {
@@ -2676,12 +3281,22 @@ class SettingsFragment : Fragment() {
             getString(R.string.self_mode)
         )
         val current = settings.connectionModes
-        val checked = BooleanArray(order.size) { order[it] in current }
+        // An empty set means "All", which the label says out loud: the three of them start checked
+        // so the dialog does not read as "none chosen".
+        val all = current.isEmpty()
+        val checked = BooleanArray(order.size) { all || order[it] in current }
+        var touched = false
         MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
             .setTitle(R.string.connection_mode)
-            .setMultiChoiceItems(labels, checked) { _, which, isChecked -> checked[which] = isChecked }
+            .setMultiChoiceItems(labels, checked) { _, which, isChecked ->
+                checked[which] = isChecked
+                touched = true
+            }
             .setPositiveButton(android.R.string.ok) { dialog, _ ->
-                settings.connectionModes = order.filterIndexed { i, _ -> checked[i] }.toSet()
+                // Left alone, "All" stays "All" instead of turning into the three modes spelled out.
+                if (!(all && !touched)) {
+                    settings.connectionModes = order.filterIndexed { i, _ -> checked[i] }.toSet()
+                }
                 dialog.dismiss()
                 updateSettingsList()
             }
@@ -2692,7 +3307,16 @@ class SettingsFragment : Fragment() {
     private data class ImportSnapshot(
         val wifiConnectionMode: WifiLauncherMode,
         val helperConnectionStrategy: HelperStrategy,
+        val nativeApStrategy: NativeStrategy,
         val bluetoothManagerServiceName: String,
+        val wirelessSelected: Boolean,
+        val wifiDirectBand: Int,
+        val fiveGhzChannel: Int,
+        val externalBtZbtTransport: Boolean,
+        val externalBtBlinkTransport: Boolean,
+        val nativeAaIgnoreExternalBt: Boolean,
+        val autoEnableHotspot: Boolean,
+        val insecureAaRfcommListener: Boolean,
         val appLanguage: String,
         val uiScaleSettingsPercent: Int,
         val appTheme: Settings.AppTheme,
@@ -2736,10 +3360,10 @@ class SettingsFragment : Fragment() {
                 withContext(Dispatchers.IO) {
                     SettingsBackupManager.exportToUri(appContext, uri)
                 }
-                Toast.makeText(requireContext(), R.string.settings_exported, Toast.LENGTH_LONG).show()
+                ToastUtils.showToast(requireContext(), R.string.settings_exported, Toast.LENGTH_LONG, force = true)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                Toast.makeText(requireContext(), getString(R.string.settings_export_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG).show()
+                ToastUtils.showToast(requireContext(), getString(R.string.settings_export_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG, force = true)
             }
         }
     }
@@ -2754,7 +3378,7 @@ class SettingsFragment : Fragment() {
                 showSettingsExportedDialog(file)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                Toast.makeText(requireContext(), getString(R.string.settings_export_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG).show()
+                ToastUtils.showToast(requireContext(), getString(R.string.settings_export_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG, force = true)
             }
         }
     }
@@ -2786,7 +3410,7 @@ class SettingsFragment : Fragment() {
                 showSettingsExportedDialog(file)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                Toast.makeText(requireContext(), getString(R.string.settings_export_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG).show()
+                ToastUtils.showToast(requireContext(), getString(R.string.settings_export_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG, force = true)
             }
         }
     }
@@ -2810,22 +3434,27 @@ class SettingsFragment : Fragment() {
                 shareSettingsBackup(file)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                Toast.makeText(requireContext(), getString(R.string.settings_export_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG).show()
+                ToastUtils.showToast(requireContext(), getString(R.string.settings_export_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG, force = true)
             }
         }
     }
 
     private fun shareSettingsBackup(file: File) {
         val context = requireContext()
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-            type = SettingsBackupManager.MIME_TYPE
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
+        // getUriForFile is inside the try: a file outside the provider's declared roots throws
+        // IllegalArgumentException, and out of a click handler that kills the app. Naming the path
+        // is the same answer as having no app to share with, so both land in the one dialog.
         try {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = SettingsBackupManager.MIME_TYPE
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
             startActivity(Intent.createChooser(shareIntent, getString(R.string.share_settings_backup)))
-        } catch (e: ActivityNotFoundException) {
+        } catch (e: Exception) {
+            if (e !is ActivityNotFoundException && e !is IllegalArgumentException) throw e
+            AppLog.w("SettingsFragment: could not share ${file.absolutePath}: ${e.message}")
             MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
                 .setTitle(R.string.settings_exported)
                 .setMessage(getString(R.string.settings_backup_saved_to, file.absolutePath))
@@ -2842,6 +3471,7 @@ class SettingsFragment : Fragment() {
                 .setPositiveButton(R.string.discard) { _, _ ->
                     hasChanges = false
                     requiresRestart = false
+                    requiresServiceRestart = false
                     reloadPendingStateFromSettings()
                     updateSaveButtonState()
                     updateSettingsList()
@@ -2874,7 +3504,7 @@ class SettingsFragment : Fragment() {
                 handleResetSettings(snapshot, result)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                Toast.makeText(appContext, appContext.getString(R.string.settings_reset_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG).show()
+                ToastUtils.showToast(appContext, appContext.getString(R.string.settings_reset_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG, force = true)
             }
         }
     }
@@ -2894,7 +3524,7 @@ class SettingsFragment : Fragment() {
         ctx.sendBroadcast(nightModeUpdateIntent)
 
         if (SettingsBackupManager.requiresProjectionRestart(result.changedKeys) && App.provide(ctx).commManager.isConnected) {
-            Toast.makeText(ctx, ctx.getString(R.string.stopping_service), Toast.LENGTH_SHORT).show()
+            ToastUtils.showToast(ctx, ctx.getString(R.string.stopping_service), Toast.LENGTH_SHORT, force = true)
             val stopServiceIntent = Intent(ctx, AapService::class.java).apply {
                 action = AapService.ACTION_STOP_SERVICE
             }
@@ -2903,11 +3533,12 @@ class SettingsFragment : Fragment() {
 
         hasChanges = false
         requiresRestart = false
+        requiresServiceRestart = false
         reloadPendingStateFromSettings()
         updateSaveButtonState()
         updateSettingsList()
 
-        Toast.makeText(ctx, R.string.settings_reset, Toast.LENGTH_LONG).show()
+        ToastUtils.showToast(ctx, R.string.settings_reset, Toast.LENGTH_LONG, force = true)
 
         if (shouldRecreateAfterImport(snapshot)) {
             activity?.recreate()
@@ -2922,6 +3553,7 @@ class SettingsFragment : Fragment() {
                 .setPositiveButton(R.string.discard) { _, _ ->
                     hasChanges = false
                     requiresRestart = false
+                    requiresServiceRestart = false
                     reloadPendingStateFromSettings()
                     updateSaveButtonState()
                     updateSettingsList()
@@ -3050,7 +3682,7 @@ class SettingsFragment : Fragment() {
                 handleImportedSettings(snapshot, result)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                Toast.makeText(requireContext(), getString(R.string.settings_import_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG).show()
+                ToastUtils.showToast(requireContext(), getString(R.string.settings_import_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG, force = true)
             }
         }
     }
@@ -3066,7 +3698,7 @@ class SettingsFragment : Fragment() {
                 handleImportedSettings(snapshot, result)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                Toast.makeText(requireContext(), getString(R.string.settings_import_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG).show()
+                ToastUtils.showToast(requireContext(), getString(R.string.settings_import_failed, e.localizedMessage ?: ""), Toast.LENGTH_LONG, force = true)
             }
         }
     }
@@ -3075,7 +3707,16 @@ class SettingsFragment : Fragment() {
         return ImportSnapshot(
             wifiConnectionMode = settings.wifiConnectionMode,
             helperConnectionStrategy = settings.helperConnectionStrategy,
+            nativeApStrategy = settings.nativeApStrategy,
             bluetoothManagerServiceName = settings.bluetoothManagerServiceName,
+            wirelessSelected = settings.showsWifi(),
+            wifiDirectBand = settings.wifiDirectBand,
+            fiveGhzChannel = settings.fiveGhzChannel,
+            externalBtZbtTransport = settings.externalBtZbtTransport,
+            externalBtBlinkTransport = settings.externalBtBlinkTransport,
+            nativeAaIgnoreExternalBt = settings.nativeAaIgnoreExternalBt,
+            autoEnableHotspot = settings.autoEnableHotspot,
+            insecureAaRfcommListener = settings.insecureAaRfcommListener,
             appLanguage = settings.appLanguage,
             uiScaleSettingsPercent = settings.uiScaleSettingsPercent,
             appTheme = settings.appTheme,
@@ -3101,7 +3742,7 @@ class SettingsFragment : Fragment() {
         ctx.sendBroadcast(nightModeUpdateIntent)
 
         if (SettingsBackupManager.requiresProjectionRestart(result.changedKeys) && App.provide(ctx).commManager.isConnected) {
-            Toast.makeText(ctx, getString(R.string.stopping_service), Toast.LENGTH_SHORT).show()
+            ToastUtils.showToast(ctx, getString(R.string.stopping_service), Toast.LENGTH_SHORT, force = true)
             val stopServiceIntent = Intent(ctx, AapService::class.java).apply {
                 action = AapService.ACTION_STOP_SERVICE
             }
@@ -3110,31 +3751,57 @@ class SettingsFragment : Fragment() {
 
         hasChanges = false
         requiresRestart = false
+        requiresServiceRestart = false
         reloadPendingStateFromSettings()
         updateSaveButtonState()
         updateSettingsList()
 
-        Toast.makeText(
+        ToastUtils.showToast(
             ctx,
             getString(R.string.settings_imported, result.importedKeys, result.skippedKeys),
-            Toast.LENGTH_LONG
-        ).show()
+            Toast.LENGTH_LONG,
+            force = true
+        )
 
         if (shouldRecreateAfterImport(snapshot)) {
             activity?.recreate()
         }
     }
 
+    /** What a launcher reads once at construction, for [WirelessRearmPolicy]. */
+    private fun wirelessRearmConfig() = WirelessRearmPolicy.Config(
+        wifiConnectionMode = settings.wifiConnectionMode,
+        helperConnectionStrategy = settings.helperConnectionStrategy,
+        nativeApStrategy = settings.nativeApStrategy,
+        bluetoothManagerServiceName = settings.bluetoothManagerServiceName,
+        wirelessSelected = settings.showsWifi(),
+        wifiDirectBand = settings.wifiDirectBand,
+        fiveGhzChannel = settings.fiveGhzChannel,
+        externalBtZbtTransport = settings.externalBtZbtTransport,
+        externalBtBlinkTransport = settings.externalBtBlinkTransport,
+        nativeAaIgnoreExternalBt = settings.nativeAaIgnoreExternalBt,
+        autoEnableHotspot = settings.autoEnableHotspot,
+        insecureAaRfcommListener = settings.insecureAaRfcommListener,
+    )
+
     private fun applyWirelessSideEffects(snapshot: ImportSnapshot, context: Context = requireContext()) {
-        if (snapshot.wifiConnectionMode != settings.wifiConnectionMode ||
-            snapshot.helperConnectionStrategy != settings.helperConnectionStrategy ||
-            snapshot.bluetoothManagerServiceName != settings.bluetoothManagerServiceName) {
-            val intent = Intent(context, AapService::class.java).apply {
-                val mode = settings.wifiConnectionMode
-                action = if (mode != WifiLauncherMode.MANUAL)
-                    AapService.ACTION_START_WIRELESS else AapService.ACTION_STOP_WIRELESS
-            }
-            context.startService(intent)
+        val before = WirelessRearmPolicy.Config(
+            wifiConnectionMode = snapshot.wifiConnectionMode,
+            helperConnectionStrategy = snapshot.helperConnectionStrategy,
+            nativeApStrategy = snapshot.nativeApStrategy,
+            bluetoothManagerServiceName = snapshot.bluetoothManagerServiceName,
+            wirelessSelected = snapshot.wirelessSelected,
+            wifiDirectBand = snapshot.wifiDirectBand,
+            fiveGhzChannel = snapshot.fiveGhzChannel,
+            externalBtZbtTransport = snapshot.externalBtZbtTransport,
+            externalBtBlinkTransport = snapshot.externalBtBlinkTransport,
+            nativeAaIgnoreExternalBt = snapshot.nativeAaIgnoreExternalBt,
+            autoEnableHotspot = snapshot.autoEnableHotspot,
+            insecureAaRfcommListener = snapshot.insecureAaRfcommListener,
+        )
+        if (WirelessRearmPolicy.requiresRearm(before, wirelessRearmConfig())) {
+            AapService.applyWirelessSettings(context,
+                startWireless = settings.wifiConnectionMode != WifiLauncherMode.MANUAL && settings.showsWifi())
         }
     }
 
@@ -3368,98 +4035,13 @@ class SettingsFragment : Fragment() {
         dialog.show()
     }
 
-    private fun showUiScaleDialog() {
-        val context = requireContext()
-        val density = context.resources.displayMetrics.density
 
-        val container = android.widget.LinearLayout(context).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
-            val pad = (16 * density).toInt()
-            setPadding(pad, pad, pad, pad)
-        }
 
-        fun makeRow(labelText: String, initialPercent: Int): Triple<android.widget.TextView, android.widget.SeekBar, android.widget.TextView> {
-            val label = android.widget.TextView(context).apply {
-                text = labelText
-                setPadding(0, (8 * density).toInt(), 0, (4 * density).toInt())
-            }
-            val seek = android.widget.SeekBar(context).apply {
-                // Map 100..150 step 10 -> progress 0..5
-                max = 5
-                progress = ((initialPercent - 100) / 10).coerceIn(0, 5)
-            }
-            val value = android.widget.TextView(context).apply {
-                text = "$initialPercent%"
-                setPadding(0, (4 * density).toInt(), 0, (12 * density).toInt())
-            }
-            // Update value when seek changes
-            seek.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(sb: android.widget.SeekBar?, progress: Int, fromUser: Boolean) {
-                    val pct = 100 + progress * 10
-                    value.text = "$pct%"
-                }
-                override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
-                override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {}
-            })
-
-            return Triple(label, seek, value)
-        }
-
-        val homeInitial = pendingUiScaleHomePercent ?: settings.uiScaleHomePercent
-        val settingsInitial = pendingUiScaleSettingsPercent ?: settings.uiScaleSettingsPercent
-
-        val (homeLabel, homeSeek, homeValue) = makeRow(getString(R.string.ui_scale_home), homeInitial)
-        val (settingsLabel, settingsSeek, settingsValue) = makeRow(getString(R.string.ui_scale_settings), settingsInitial)
-
-        container.addView(homeLabel, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
-        container.addView(homeSeek, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
-        container.addView(homeValue, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
-        container.addView(settingsLabel, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
-        container.addView(settingsSeek, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
-        container.addView(settingsValue, android.widget.LinearLayout.LayoutParams(android.widget.LinearLayout.LayoutParams.MATCH_PARENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT))
-
-        // Wrap content in a ScrollView to ensure content is scrollable on small screens or when large scale is used
-        val scroll = android.widget.ScrollView(context).apply {
-            isFillViewport = true
-            addView(container, android.widget.FrameLayout.LayoutParams(android.widget.FrameLayout.LayoutParams.MATCH_PARENT, android.widget.FrameLayout.LayoutParams.WRAP_CONTENT))
-        }
-
-        MaterialAlertDialogBuilder(context, R.style.DarkAlertDialog)
-            .setTitle(R.string.ui_scale)
-            .setView(scroll)
-            .setPositiveButton(android.R.string.ok) { dialog, _ ->
-                val newHome = 100 + (homeSeek.progress * 10)
-                val newSettings = 100 + (settingsSeek.progress * 10)
-                val oldSettings = settings.uiScaleSettingsPercent
-                val oldHome = settings.uiScaleHomePercent
-
-                // Persist immediately (similar to Custom Insets behavior)
-                settings.uiScaleHomePercent = newHome
-                settings.uiScaleSettingsPercent = newSettings
-                settings.commit()
-
-                pendingUiScaleHomePercent = newHome
-                pendingUiScaleSettingsPercent = newSettings
-                checkChanges()
-                updateSettingsList()
-
-                dialog.dismiss()
-
-                // If Settings value changed, recreate activity as requested
-                if (newSettings != oldSettings) {
-                    requireActivity().recreate()
-                }
-                // If Home UI scale changed, request MainActivity to recreate
-                if (newHome != oldHome) {
-                    val intent = Intent(MainActivity.ACTION_RECREATE_MAIN).apply {
-                        setPackage(requireContext().packageName)
-                    }
-                    requireContext().sendBroadcast(intent)
-                }
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
+    private fun wifiScanSummary(): String =
+        com.andrerinas.openheadunit.connection.wifi.scan.WifiScanControl.summaryText(
+            requireContext(),
+            nativeHost = (pendingWifiConnectionMode ?: settings.wifiConnectionMode) == WifiLauncherMode.NATIVE,
+            hotspot = (pendingNativeApTransport ?: settings.nativeApStrategy) == NativeStrategy.HOTSPOT)
 
     override fun onResume() {
         super.onResume()
@@ -3468,6 +4050,10 @@ class SettingsFragment : Fragment() {
             settings = App.provide(requireContext()).settings
             updateSettingsList()
         }
+
+        // A probe started before the vendor's projection app took the screen is still running. Pick
+        // its row back up, so coming back here shows where it got to rather than a stale line.
+        if (zbtProbeJob?.isActive == true) followZbtProbe()
     }
 
     private fun getKillOnDisconnectConflicts(): List<String> {
@@ -3513,7 +4099,7 @@ class SettingsFragment : Fragment() {
                 confirmed = true
                 if (hasDisableableConflicts) {
                     disableKillOnDisconnectConflicts()
-                    Toast.makeText(context, getString(R.string.kill_on_disconnect_conflicts_disabled), Toast.LENGTH_LONG).show()
+                    ToastUtils.showToast(context, getString(R.string.kill_on_disconnect_conflicts_disabled), Toast.LENGTH_LONG, force = true)
                 }
                 pendingKillOnDisconnect = true
                 checkChanges()
@@ -3598,9 +4184,343 @@ class SettingsFragment : Fragment() {
     private fun pendingNativeTransport(): NativeTransport =
         pendingNativeApTransport ?: NativeStrategy.DEFAULT
 
+    /** The Bluetooth route represented by the unsaved controls currently on screen. */
+    private fun pendingExternalBtRoute(): ExternalBtTransportPolicy.Route =
+        ExternalBtTransportPolicy.route(
+            ZbtDiscovery.snapshot(),
+            pendingExternalBtZbtTransport ?: settings.externalBtZbtTransport,
+            pendingNativeAaIgnoreExternalBt ?: settings.nativeAaIgnoreExternalBt,
+            blinkTransportEnabled = pendingExternalBtBlinkTransport ?: settings.externalBtBlinkTransport,
+            fytModuleEvidence = BluetoothHelper.fytModuleEvidence,
+            hctServiceAvailable = HctServiceObserver.available(requireContext())
+        )
+
     /** The WiFi Direct band the block is currently showing settings for. */
     private fun pendingP2pBandPreference(): P2pBandPreference =
         P2pBandPreference.fromSetting(pendingWifiDirectBand ?: 0)
+
+    /** The hotspot band the block is currently showing settings for. */
+    private fun pendingHotspotBandPreference(): HotspotBandPreference =
+        HotspotBandPreference.fromSetting(pendingHotspotBand ?: 0)
+
+    /**
+     * Which 5 GHz channel to ask for, on whichever transport this block is showing.
+     *
+     * One setting shown in three places rather than one per transport: which channels a phone will
+     * join is decided by its own regulatory domain, so the answer follows the user's phone and
+     * country and not the transport, and somebody who switches transport to work around the problem
+     * must not silently lose the choice.
+     *
+     * A dialog rather than the segmented buttons the two band settings use, because there are five
+     * channels and that layout holds three.
+     */
+    private fun addFiveGhzChannelSetting(items: MutableList<SettingItem>) {
+        val current = FiveGhzChannelPolicy.pinnedChannel(pendingFiveGhzChannel ?: 0)
+        val values = listOf(FiveGhzChannelPolicy.AUTOMATIC) + FiveGhzChannelPolicy.CHANNELS
+        val labels = values.map { channel ->
+            if (channel == FiveGhzChannelPolicy.AUTOMATIC) getString(R.string.five_ghz_channel_auto)
+            else getString(
+                R.string.five_ghz_channel_option,
+                channel,
+                FiveGhzChannelPolicy.frequencyMhz(channel),
+            )
+        }.toTypedArray()
+        items.add(SettingItem.SettingEntry(
+            stableId = "fiveGhzChannel",
+            nameResId = R.string.five_ghz_channel,
+            value = labels[values.indexOf(current)],
+            searchKeywords = "channel 36 40 44 48 149 unii 5ghz region country band",
+            onClick = { _ ->
+                MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+                    .setTitle(R.string.five_ghz_channel)
+                    .setSingleChoiceItems(labels, values.indexOf(current)) { dialog, which ->
+                        pendingFiveGhzChannel = values[which]
+                        checkChanges()
+                        dialog.dismiss()
+                        updateSettingsList()
+                    }
+                    .show()
+            }
+        ))
+        items.add(SettingItem.InfoBanner(
+            stableId = "fiveGhzChannelHint",
+            textResId = R.string.five_ghz_channel_hint
+        ))
+    }
+
+    /**
+     * Whether this unit leaves its own WiFi network for the bring-up. Only where the platform would
+     * honour it: below Android 10 anything may ask, from 10 to 14 the overlay permission gets past
+     * the framework's check and the hint says so, and from 15 there is no route, so no row.
+     */
+    private fun addStationStandDownSetting(items: MutableList<SettingItem>) {
+        if (!StationStandDownPolicy.isAvailable(Build.VERSION.SDK_INT, true)) return
+        items.add(SettingItem.SegmentedButtonSettingEntry(
+            stableId = "stationStandDownMode",
+            nameResId = R.string.stand_down_station,
+            options = listOf(
+                getString(R.string.stand_down_station_auto),
+                getString(R.string.stand_down_station_always),
+                getString(R.string.stand_down_station_never)
+            ),
+            selectedIndex = (pendingStationStandDownMode ?: 0).coerceIn(0, 2),
+            onOptionSelected = { index ->
+                pendingStationStandDownMode = index
+                checkChanges()
+                updateSettingsList()
+            }
+        ))
+        val overlayGranted = AppPermissions.isOverlayGranted(requireContext())
+        val hint = getString(R.string.stand_down_station_hint)
+        items.add(SettingItem.InfoBanner(
+            stableId = "stationStandDownHint",
+            textResId = R.string.stand_down_station_hint,
+            text = if (StationStandDownPolicy.isAvailable(Build.VERSION.SDK_INT, overlayGranted)) hint
+                else getString(R.string.stand_down_station_needs_overlay) + " " + hint
+        ))
+    }
+
+    /**
+     * Whether the group keeps its name and passphrase between bring-ups, and what can change them.
+     *
+     * Only where the group is ours to name: the hotspot's identity is the access point's own. From
+     * API 29 one row owns the pair, typed or drawn. Below it nothing can name a group, so the rotate
+     * row is the only lever and it works by purging the platform's stored profile.
+     */
+    private fun addWifiDirectIdentitySettings(items: MutableList<SettingItem>) {
+        // Below API 29 the app cannot name the group at all: the platform picks the name and keeps
+        // its own profile, so the toggle and the rows describe that arrangement instead of this one.
+        val appNamesGroup = Build.VERSION.SDK_INT >= P2pIdentityRotationPolicy.NAMED_CREATE_SDK
+        items.add(SettingItem.ToggleSettingEntry(
+            stableId = "wifiDirectStableIdentity",
+            nameResId = R.string.wifi_direct_stable_identity,
+            descriptionResId = if (appNamesGroup) R.string.wifi_direct_stable_identity_description
+                else R.string.wifi_direct_stable_identity_description_legacy,
+            isChecked = pendingWifiDirectStableIdentity ?: settings.wifiDirectStableIdentity,
+            searchKeywords = "persistent group ssid passphrase password same network reconnect faster",
+            onCheckedChanged = { isChecked ->
+                pendingWifiDirectStableIdentity = isChecked
+                checkChanges()
+                updateSettingsList()
+            }
+        ))
+        // Above the early return below: what the last group actually was is worth reading whether or
+        // not its identity is kept, and below API 29 it is the only place the pair is ever legible.
+        addWifiDirectLastNetworkRow(items)
+        if (pendingWifiDirectStableIdentity == false) return
+        if (appNamesGroup) {
+            // One row owns the pair here, and its "pick new ones" button is what the separate
+            // rotate row below does, so that row would be a second way to do the same thing.
+            addWifiDirectIdentityEditRow(items)
+            return
+        }
+        items.add(SettingItem.InfoBanner(
+            stableId = "wifiDirectIdentityLegacy",
+            textResId = R.string.wifi_direct_group_identity_legacy
+        ))
+        // Below API 29 this is the only rename lever there is: nothing can name a group, so the
+        // platform's stored profile has to be purged for it to pick a different one.
+        items.add(SettingItem.SettingEntry(
+            stableId = "wifiDirectNewIdentity",
+            nameResId = R.string.wifi_direct_new_identity,
+            // The read-back record, not the stability yardstick: that one is only written on an
+            // assessed create, so it can name a group older than the one on the air.
+            value = settings.wifiDirectLastReadBack?.networkName
+                ?: getString(R.string.wifi_direct_new_identity_none),
+            searchKeywords = "forget reset ssid passphrase password group name",
+            onClick = { _ ->
+                MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+                    .setTitle(R.string.wifi_direct_new_identity)
+                    .setMessage(R.string.wifi_direct_new_identity_confirm)
+                    .setPositiveButton(android.R.string.ok) { _, _ ->
+                        settings.wifiDirectRotationPending = true
+                        rotateWifiDirectIdentityNow()
+                        updateSettingsList()
+                    }
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show()
+            }
+        ))
+    }
+
+    /**
+     * Fires the rotate, which the service applies now or defers, and says which it did.
+     *
+     * The saved mode, not the pending one: the running launcher is what the service asks. A
+     * handshake is invisible from here, so the toast can only be hopeful.
+     */
+    private fun rotateWifiDirectIdentityNow() {
+        requireContext().startService(
+            Intent(requireContext(), AapService::class.java).apply {
+                action = AapService.ACTION_ROTATE_WIFI_DIRECT_IDENTITY
+            }
+        )
+        val appliesNow = P2pIdentityRotationPolicy.applyNow(
+            sessionLive = App.provide(requireContext()).commManager.isConnected,
+            handshakeInFlight = false,
+            nativeWifiDirectActive = settings.wifiConnectionMode == WifiLauncherMode.NATIVE &&
+                settings.nativeApStrategy == NativeStrategy.WIFI_DIRECT,
+        )
+        ToastUtils.showToast(
+            requireContext(),
+            if (appliesNow) R.string.wifi_direct_new_identity_applied
+            else R.string.wifi_direct_new_identity_done,
+            Toast.LENGTH_LONG,
+            force = true
+        )
+    }
+
+    /**
+     * The name, password and address the last group actually came up with, whatever named it.
+     *
+     * Read from a persisted record rather than the live group, because this screen stops the
+     * wireless stack before it draws. The row never shows the password; the dialog does.
+     */
+    private fun addWifiDirectLastNetworkRow(items: MutableList<SettingItem>) {
+        val onAir = settings.wifiDirectLastReadBack
+        items.add(SettingItem.SettingEntry(
+            stableId = "wifiDirectLastNetwork",
+            nameResId = R.string.wifi_direct_last_network,
+            value = onAir?.networkName ?: getString(R.string.wifi_direct_last_network_none),
+            searchKeywords = "wifi direct ssid passphrase password bssid mac address show see what is my network",
+            onClick = { _ -> showWifiDirectLastNetworkDialog(onAir) }
+        ))
+    }
+
+    private fun showWifiDirectLastNetworkDialog(onAir: ObservedP2pCredentials?) {
+        val body = StringBuilder()
+        if (onAir == null) {
+            body.append(getString(R.string.wifi_direct_last_network_none))
+        } else {
+            body.append(
+                getString(
+                    R.string.wifi_direct_last_network_details,
+                    onAir.networkName,
+                    onAir.passphrase,
+                    onAir.bssid.ifEmpty { getString(R.string.wifi_direct_last_network_address_unknown) },
+                )
+            )
+            // The one failure this dialog is most often opened for, named in the user's terms.
+            if (!SoftApBssidPolicy.isUsable(onAir.bssid)) {
+                body.append("\n\n").append(getString(R.string.wifi_direct_last_network_no_bssid))
+            }
+            val asked = settings.wifiDirectGroupIdentity
+            if (Build.VERSION.SDK_INT >= P2pIdentityRotationPolicy.NAMED_CREATE_SDK && asked != null &&
+                (asked.networkName != onAir.networkName || asked.passphrase != onAir.passphrase)
+            ) {
+                body.append("\n\n").append(getString(R.string.wifi_direct_last_network_differs))
+            }
+        }
+        body.append("\n\n").append(getString(R.string.wifi_direct_last_network_hint))
+        val builder = MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+            .setTitle(R.string.wifi_direct_last_network_title)
+            .setMessage(body.toString())
+            .setPositiveButton(android.R.string.ok, null)
+        if (onAir != null) {
+            builder.setNeutralButton(R.string.copy) { _, _ ->
+                val clipboard = requireContext()
+                    .getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                clipboard?.setPrimaryClip(ClipData.newPlainText(onAir.networkName, onAir.passphrase))
+                ToastUtils.showToast(
+                    requireContext(), R.string.wifi_direct_credentials_copied,
+                    Toast.LENGTH_SHORT, force = true
+                )
+            }
+        }
+        builder.show()
+    }
+
+    /** The typed pair. Both fields in one dialog, because a password moves the name with it. */
+    private fun addWifiDirectIdentityEditRow(items: MutableList<SettingItem>) {
+        val userSet = pendingWifiDirectIdentityUserSet ?: settings.wifiDirectIdentityUserSet
+        val pair = pendingWifiDirectGroupIdentity
+        items.add(SettingItem.SettingEntry(
+            stableId = "wifiDirectGroupIdentity",
+            nameResId = R.string.wifi_direct_group_identity,
+            value = if (userSet && pair != null)
+                pair.networkName + "  ·  " + "•".repeat(pair.passphrase.length)
+            else getString(R.string.wifi_direct_group_identity_auto),
+            searchKeywords = "wifi direct ssid network name passphrase password set change custom own known",
+            onClick = { _ ->
+                DialogUtils.showTwoFieldDialog(
+                    requireContext(),
+                    R.string.wifi_direct_group_identity,
+                    R.string.wifi_direct_group_identity_message,
+                    R.string.wifi_direct_group_identity_name_hint,
+                    if (userSet) pair?.networkName else null,
+                    R.string.wifi_direct_group_identity_passphrase_hint,
+                    if (userSet) pair?.passphrase else null,
+                    neutralResId = R.string.wifi_direct_group_identity_pick_new,
+                    onNeutral = { clearWifiDirectIdentity() },
+                ) { typedName, typedPassphrase ->
+                    applyWifiDirectIdentityEdit(typedName, typedPassphrase)
+                }
+            }
+        ))
+    }
+
+    /**
+     * Hands the pair back to the app, which draws a fresh one at the next create. Unlike an empty
+     * OK this always applies: asking for new values is a request even when none were typed.
+     */
+    private fun clearWifiDirectIdentity() {
+        pendingWifiDirectGroupIdentity = null
+        pendingWifiDirectIdentityUserSet = false
+        checkChanges()
+        updateSettingsList()
+    }
+
+    private fun applyWifiDirectIdentityEdit(typedName: String, typedPassphrase: String) {
+        when (val outcome = P2pIdentityEditPolicy.edit(
+            current = pendingWifiDirectGroupIdentity,
+            typedName = typedName,
+            typedPassphrase = typedPassphrase,
+            deviceName = AapService.wifiDirectName.value,
+        )) {
+            is P2pIdentityEdit.Rejected -> {
+                // Rejected at the dialog, like the static BSSID row: a pair the platform refuses
+                // fails much later, at createGroup, where nothing points back at what was typed.
+                ToastUtils.showToast(
+                    requireContext(),
+                    when (outcome.why) {
+                        P2pIdentityRejection.NAME_SHAPE ->
+                            R.string.wifi_direct_group_identity_invalid_name
+                        P2pIdentityRejection.PASSPHRASE_LENGTH ->
+                            R.string.wifi_direct_group_identity_invalid_passphrase_length
+                        P2pIdentityRejection.PASSPHRASE_CHARSET ->
+                            R.string.wifi_direct_group_identity_invalid_passphrase_charset
+                    },
+                    Toast.LENGTH_LONG, force = true
+                )
+                return
+            }
+            P2pIdentityEdit.Unchanged -> return
+            P2pIdentityEdit.Cleared -> {
+                // OK on an untouched dialog must not read as "discard the pair": clearing is only a
+                // change where there was typing to clear, and otherwise renames the group for nothing.
+                // The neutral button is the deliberate ask and goes through clearWifiDirectIdentity.
+                if (pendingWifiDirectIdentityUserSet != true) return
+                pendingWifiDirectGroupIdentity = null
+                pendingWifiDirectIdentityUserSet = false
+            }
+            is P2pIdentityEdit.Accepted -> {
+                pendingWifiDirectGroupIdentity = outcome.identity
+                pendingWifiDirectIdentityUserSet = true
+                if (outcome.recoded) {
+                    ToastUtils.showToast(
+                        requireContext(),
+                        getString(
+                            R.string.wifi_direct_group_identity_recoded,
+                            outcome.identity.networkName
+                        ),
+                        Toast.LENGTH_LONG, force = true
+                    )
+                }
+            }
+        }
+        checkChanges()
+        updateSettingsList()
+    }
 
     /**
      * The band to ask for when this app creates the WiFi Direct group, plus what that choice costs.
@@ -3635,6 +4555,40 @@ class SettingsFragment : Fragment() {
             stableId = "wifiDirectBandHint",
             textResId = R.string.wifi_direct_band_hint
         ))
+        items.add(SettingItem.ToggleSettingEntry(
+            stableId = "autoRestartWifiWhenP2pStuck",
+            nameResId = R.string.auto_restart_wifi_title,
+            descriptionResId = R.string.auto_restart_wifi_description,
+            isChecked = pendingAutoRestartWifi ?: settings.autoRestartWifiWhenP2pStuck,
+            onCheckedChanged = { isChecked ->
+                pendingAutoRestartWifi = isChecked
+                checkChanges()
+                updateSettingsList()
+                if (isChecked) probeWifiRestartRoute()
+            }
+        ))
+    }
+
+    /**
+     * Ask for root, or run one ADB command, now, while the user is at the settings screen. Asking
+     * later would put a root prompt or "Allow USB debugging?" in front of a driver.
+     */
+    private fun probeWifiRestartRoute() {
+        viewLifecycleOwner.lifecycleScope.launch {
+            val ctx = context ?: return@launch
+            val rootGranted = WifiStackRecovery.requestRoot()
+            settings.wifiRestartRootGranted = rootGranted
+            val adbVerified = !rootGranted &&
+                WifiStackRecovery.availableRoute() == OemAppManager.ExecutionBackend.ADB &&
+                WifiStackRecovery.verifyAdb(ctx.applicationContext)
+            settings.wifiRestartAdbVerified = adbVerified
+            val message = when {
+                rootGranted -> R.string.auto_restart_wifi_root_granted
+                adbVerified -> R.string.auto_restart_wifi_adb
+                else -> R.string.auto_restart_wifi_unavailable
+            }
+            ToastUtils.showToast(ctx, message, Toast.LENGTH_LONG, force = true)
+        }
     }
 
     /**
@@ -3813,25 +4767,46 @@ class SettingsFragment : Fragment() {
     }
 
     private fun handleNativeAaSelection() {
-        // An external Bluetooth module is not a "might not work" — the phone is bonded to a chip
-        // this app cannot write to, so say so plainly and name the evidence instead of offering
-        // the generic "try it anyway".
-        val externalBtEvidence = BluetoothHelper.externalBtEvidence
+        // Retain the existing marker-specific explanation: the phone may be bonded to a chip
+        // outside Android's paired-device list, so a generic compatibility dialog is insufficient.
+        // Known external-module markers and firmware candidates both justify checking ZBT.
+        // Candidates get the normal Android compatibility dialog if the bridge is unconfirmed;
+        // only established external-module evidence can justify the module-specific refusal.
+        val discovery = ZbtDiscovery.snapshot()
+        val measurement = ZbtDiscovery.measurement(discovery.decision)
+        val externalBtEvidence = measurement.decision.evidence
         if (externalBtEvidence != null) {
-            MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
-                .setTitle(R.string.external_bt_nativeaa)
-                .setMessage(getString(R.string.external_bt_nativeaa_desc, externalBtEvidence))
-                // Selecting the mode is still allowed: on a unit with a second, reachable radio
-                // the user can name it under the secondary-Bluetooth setting, and Native mode
-                // will then run. Without that it stays switched off, and the log says why.
-                .setPositiveButton(android.R.string.ok) { dialog, _ ->
-                    acceptNativeAaMode()
-                    dialog.dismiss()
+            // Unless there is a route to that chip, in which case the flat refusal below would be
+            // wrong: either the user turned the transport on, or the daemon answered when asked.
+            // The dial is a socket connect, so it never happens on this thread.
+            // ZBT only counts off FYT module units, where the route can actually take it.
+            val chosen = ((pendingExternalBtZbtTransport ?: settings.externalBtZbtTransport) &&
+                BluetoothHelper.fytModuleEvidence == null) ||
+                (pendingExternalBtBlinkTransport ?: settings.externalBtBlinkTransport)
+            externalBtRouteJob?.cancel()
+            externalBtRouteJob = viewLifecycleOwner.lifecycleScope.launch {
+                val viaModule = if (chosen) true else if (BluetoothHelper.fytModuleEvidence != null) false else {
+                    discovery.reachable
+                        ?: withContext(Dispatchers.IO) {
+                            measurement.resolve(
+                                cacheIdentityRefusal = false
+                            )
+                        }
                 }
-                .setNegativeButton(android.R.string.cancel, null)
-                .show()
+                if (!isAdded) return@launch
+                if (measurement.fallsBackToAndroid && !viaModule) {
+                    showAndroidNativeAaCompatibility()
+                } else showExternalBtNativeAaDialog(externalBtEvidence, viaModule)
+            }
             return
         }
+        showAndroidNativeAaCompatibility()
+    }
+
+    // Extracted from the no-external-marker branch of handleNativeAaSelection. An unconfirmed
+    // firmware candidate needs that same Android check and dialog, not the module refusal.
+    // Keep both callers on this implementation so their compatibility advice stays identical.
+    private fun showAndroidNativeAaCompatibility() {
         if (NativeAaHandshakeManager.checkCompatibility(requireContext())) {
             MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
                 .setTitle(R.string.supported_nativeaa)
@@ -3853,6 +4828,25 @@ class SettingsFragment : Fragment() {
                 .setNegativeButton(android.R.string.cancel, null)
                 .show()
         }
+    }
+
+    /** The external-module dialog, once the route it should describe is known. */
+    private fun showExternalBtNativeAaDialog(externalBtEvidence: String, viaModule: Boolean) {
+        MaterialAlertDialogBuilder(requireContext(), R.style.DarkAlertDialog)
+            .setTitle(if (viaModule) R.string.external_bt_module_nativeaa else R.string.external_bt_nativeaa)
+            .setMessage(
+                if (viaModule) getString(R.string.external_bt_module_nativeaa_desc, externalBtEvidence)
+                else getString(R.string.external_bt_nativeaa_desc, externalBtEvidence)
+            )
+            // Selecting the mode is still allowed either way. With a route to the module it is a
+            // real choice; without one the mode is stored but the route stays switched off at
+            // connection time, so turning the transport on later needs no second visit here.
+            .setPositiveButton(android.R.string.ok) { dialog, _ ->
+                acceptNativeAaMode()
+                dialog.dismiss()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     /**
@@ -3899,7 +4893,10 @@ class SettingsFragment : Fragment() {
                     // in this session and not saved yet, and asking for it again would be absurd.
                     manualSsid = pendingHotspotSsid.orEmpty(),
                     manualPassword = pendingHotspotPassword.orEmpty(),
-                    staticBssid = pendingStaticBSSID,
+                    // The value for the transport being probed: the two addresses are different
+                    // interfaces and one is never an answer for the other.
+                    staticBssid = if (transport == NativeTransport.WIFI_DIRECT) pendingStaticP2pBSSID
+                    else pendingStaticBSSID,
                     hotspotInterface = pendingHotspotInterface.orEmpty()
                 )
                 NativeCredentialsPreflightPolicy.evaluate(transport, probe)
@@ -4004,11 +5001,20 @@ class SettingsFragment : Fragment() {
                 next()
             }
 
-            CredentialField.BSSID -> DialogUtils.showTextInputDialogWithMessage(
+            // The field for the transport the probe ran on. The two addresses are different
+            // interfaces, so writing the access point's here would be the mismatch this flow exists
+            // to repair.
+            CredentialField.BSSID -> {
+                val forP2p = pendingNativeTransport() == NativeTransport.WIFI_DIRECT
+                val current = if (forP2p) pendingStaticP2pBSSID else pendingStaticBSSID
+                fun store(value: String) {
+                    if (forP2p) pendingStaticP2pBSSID = value else pendingStaticBSSID = value
+                }
+                DialogUtils.showTextInputDialogWithMessage(
                 requireContext(),
-                R.string.static_bssid_title,
-                R.string.static_bssid_desc,
-                pendingStaticBSSID?.takeIf { SoftApBssidPolicy.isUsable(it) }.orEmpty()
+                if (forP2p) R.string.static_p2p_bssid_title else R.string.static_bssid_title,
+                if (forP2p) R.string.static_p2p_bssid_desc else R.string.static_bssid_desc,
+                current?.takeIf { SoftApBssidPolicy.isUsable(it) }.orEmpty()
             ) { newVal ->
                 // Checked here as well as at the row, because a value that is not MAC-shaped is
                 // worse than none: it beats every automatic source and fails much later, at Type 3
@@ -4016,24 +5022,25 @@ class SettingsFragment : Fragment() {
                 val trimmed = newVal.trim()
                 when {
                     trimmed.isEmpty() -> {
-                        pendingStaticBSSID = "0"
+                        store("0")
                         checkChanges()
                         updateSettingsList()
                         next()
                     }
                     SoftApBssidPolicy.isUsable(trimmed) -> {
-                        pendingStaticBSSID = trimmed
+                        store(trimmed)
                         checkChanges()
                         updateSettingsList()
                         next()
                     }
                     else -> {
-                        Toast.makeText(requireContext(), R.string.preflight_invalid_bssid, Toast.LENGTH_LONG).show()
+                        ToastUtils.showToast(requireContext(), R.string.preflight_invalid_bssid, Toast.LENGTH_LONG, force = true)
                         // Ask again rather than move on: this is the field where a wrong value does
                         // more harm than no value.
                         promptForField(missing, index)
                     }
                 }
+            }
             }
         }
     }
@@ -4053,5 +5060,228 @@ class SettingsFragment : Fragment() {
 
     companion object {
         private val SAVE_ITEM_ID = 1001
+
+        /**
+         * The external-Bluetooth probe runs here rather than on the fragment's scope, and its
+         * verdict lives here rather than on the instance.
+         *
+         * Its listening phase asks the user to start a wireless connection, which on these units
+         * means the vendor's projection app taking the display and destroying this fragment's view.
+         * A view-scoped job would die with it and report that nothing arrived during a run it was
+         * never allowed to finish, which is exactly the answer the probe exists to distinguish.
+         *
+         * Nothing here holds a Context, so outliving the screen leaks nothing.
+         */
+        private val zbtProbeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        @Volatile
+        private var zbtProbeJob: Job? = null
+
+        /** Latest probe verdict or progress line, or null if it has never been run. */
+        @Volatile
+        private var zbtProbeResult: String? = null
+    }
+
+    private fun showOemAppManagementDialog() {
+        val context = requireContext()
+        val dialogView = LayoutInflater.from(context).inflate(R.layout.dialog_oem_app_manager, null)
+
+        val tvBackendStatus = dialogView.findViewById<TextView>(R.id.tvBackendStatus)
+        val switchAutoKill = dialogView.findViewById<com.google.android.material.switchmaterial.SwitchMaterial>(R.id.switchAutoKill)
+        val progressLoading = dialogView.findViewById<ProgressBar>(R.id.progressLoading)
+        val appsContainer = dialogView.findViewById<LinearLayout>(R.id.appsContainer)
+        val tvEmptyState = dialogView.findViewById<TextView>(R.id.tvEmptyState)
+
+        val currentAutoKill = pendingAutoKillOemApps ?: settings.autoKillOemApps
+        switchAutoKill.isChecked = currentAutoKill
+        switchAutoKill.setOnCheckedChangeListener { _, isChecked ->
+            pendingAutoKillOemApps = isChecked
+            settings.autoKillOemApps = isChecked
+            checkChanges()
+            updateSettingsList()
+        }
+
+        val alertDialog = MaterialAlertDialogBuilder(context, R.style.DarkAlertDialog)
+            .setTitle(R.string.oem_app_management)
+            .setView(dialogView)
+            .setPositiveButton(R.string.close) { dialog, _ -> dialog.dismiss() }
+            .create()
+
+        var updateUI: ((List<OemAppManager.OemAppStatus>, OemAppManager.ExecutionBackend) -> Unit)? = null
+
+        val loadStatus: () -> Unit = {
+            progressLoading.visibility = View.VISIBLE
+            viewLifecycleOwner.lifecycleScope.launch {
+                val backend = OemAppManager.checkAvailableBackend()
+                val statuses = OemAppManager.detectApps(context, checkDaemons = true)
+                progressLoading.visibility = View.GONE
+                updateUI?.invoke(statuses, backend)
+            }
+        }
+
+        updateUI = { statuses, backend ->
+            when (backend) {
+                OemAppManager.ExecutionBackend.ROOT -> {
+                    tvBackendStatus.setText(R.string.oem_app_backend_root)
+                    tvBackendStatus.setTextColor(ContextCompat.getColor(context, R.color.brand_primary))
+                }
+                OemAppManager.ExecutionBackend.ADB -> {
+                    tvBackendStatus.setText(R.string.oem_app_backend_adb)
+                    tvBackendStatus.setTextColor(ContextCompat.getColor(context, R.color.brand_primary))
+                }
+                OemAppManager.ExecutionBackend.NONE -> {
+                    tvBackendStatus.setText(R.string.oem_app_backend_none)
+                    tvBackendStatus.setTextColor(ContextCompat.getColor(context, R.color.material_orange_700))
+                }
+            }
+
+            appsContainer.removeAllViews()
+            var anyFound = false
+
+            for (status in statuses) {
+                val itemView = LayoutInflater.from(context).inflate(R.layout.item_oem_app, appsContainer, false)
+                val tvAppName = itemView.findViewById<TextView>(R.id.tvAppName)
+                val tvPackageName = itemView.findViewById<TextView>(R.id.tvPackageName)
+                val tvStatusBadge = itemView.findViewById<TextView>(R.id.tvStatusBadge)
+                val btnShowCommands = itemView.findViewById<MaterialButton>(R.id.btnShowCommands)
+                val btnRestore = itemView.findViewById<MaterialButton>(R.id.btnRestore)
+                val btnDisable = itemView.findViewById<MaterialButton>(R.id.btnDisable)
+
+                tvAppName.text = status.target.displayName
+                tvPackageName.text = status.installedPackage ?: status.target.packageCandidates.first()
+
+                val installedStr = if (status.isInstalled) getString(R.string.oem_app_state_installed) else getString(R.string.oem_app_state_not_installed)
+                val enabledStr = if (status.isEnabled) getString(R.string.oem_app_state_enabled) else getString(R.string.oem_app_state_disabled)
+                val runningStr = if (status.isRunning) getString(R.string.oem_app_state_running) else getString(R.string.oem_app_state_stopped)
+
+                tvStatusBadge.text = getString(R.string.oem_app_status_format, installedStr, enabledStr, runningStr)
+
+                if (status.isInstalled) {
+                    anyFound = true
+                }
+
+                btnDisable.isEnabled = backend != OemAppManager.ExecutionBackend.NONE && status.isInstalled
+                btnRestore.isEnabled = backend != OemAppManager.ExecutionBackend.NONE && status.isInstalled
+
+                btnShowCommands.setOnClickListener {
+                    val disableCmds = OemAppManager.getDisableCommands(status).joinToString("\n")
+                    val restoreCmds = OemAppManager.getRestoreCommands(status).joinToString("\n")
+                    val fullMsg = "--- " + getString(R.string.oem_app_btn_disable) + " ---\n" + disableCmds + "\n\n--- " + getString(R.string.oem_app_btn_restore) + " ---\n" + restoreCmds
+
+                    MaterialAlertDialogBuilder(context, R.style.DarkAlertDialog)
+                        .setTitle(R.string.oem_app_commands_title)
+                        .setMessage(fullMsg)
+                        .setPositiveButton(android.R.string.ok) { d, _ -> d.dismiss() }
+                        .setNeutralButton(R.string.copy_to_clipboard) { _, _ ->
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            clipboard?.setPrimaryClip(ClipData.newPlainText("ADB Commands", fullMsg))
+                            ToastUtils.showToast(context, R.string.copied_to_clipboard, Toast.LENGTH_SHORT, force = true)
+                        }
+                        .show()
+                }
+
+                btnDisable.setOnClickListener {
+                    progressLoading.visibility = View.VISIBLE
+                    viewLifecycleOwner.lifecycleScope.launch {
+                        val (success, out) = OemAppManager.disableTarget(context, status)
+                        progressLoading.visibility = View.GONE
+                        if (success) {
+                            ToastUtils.showToast(context, R.string.oem_app_action_success, Toast.LENGTH_SHORT, force = true)
+                        } else {
+                            ToastUtils.showToast(context, getString(R.string.oem_app_action_failed, out), Toast.LENGTH_LONG, force = true)
+                        }
+                        loadStatus()
+                    }
+                }
+
+                btnRestore.setOnClickListener {
+                    progressLoading.visibility = View.VISIBLE
+                    viewLifecycleOwner.lifecycleScope.launch {
+                        val (success, out) = OemAppManager.restoreTarget(context, status)
+                        progressLoading.visibility = View.GONE
+                        if (success) {
+                            ToastUtils.showToast(context, R.string.oem_app_action_success, Toast.LENGTH_SHORT, force = true)
+                        } else {
+                            ToastUtils.showToast(context, getString(R.string.oem_app_action_failed, out), Toast.LENGTH_LONG, force = true)
+                        }
+                        loadStatus()
+                    }
+                }
+
+                appsContainer.addView(itemView)
+            }
+
+            tvEmptyState.visibility = if (anyFound) View.GONE else View.VISIBLE
+        }
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            val initialStatuses = OemAppManager.detectApps(context, checkDaemons = false)
+            updateUI?.invoke(initialStatuses, OemAppManager.ExecutionBackend.NONE)
+            loadStatus()
+        }
+
+        alertDialog.show()
+    }
+
+    private fun handleCheckForUpdates() {
+        val ctx = context ?: return
+        ToastUtils.showToast(ctx, R.string.checking_for_updates, Toast.LENGTH_SHORT, force = true)
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            val result = UpdateChecker.check(ctx)
+            if (!isAdded) return@launch
+
+            result.fold(
+                onSuccess = { info ->
+                    if (info.isUpdateAvailable) {
+                        val message = if (info.isPlayStore) {
+                            getString(R.string.update_available_playstore_message, info.latestVersionName)
+                        } else {
+                            getString(R.string.update_available_github_message, info.latestVersionName)
+                        }
+
+                        val builder = MaterialAlertDialogBuilder(ctx, R.style.DarkAlertDialog)
+                            .setTitle(R.string.update_available_title)
+                            .setMessage(message)
+                            .setNegativeButton(R.string.cancel, null)
+
+                        if (info.isPlayStore) {
+                            builder.setPositiveButton(R.string.open_play_store) { _, _ ->
+                                UpdateChecker.openPlayStore(ctx)
+                            }
+                        } else {
+                            val (primary, secondary) = UpdateLinkPolicy.choices(info.apkUrl)
+                            val open = { choice: UpdateLinkPolicy.Choice ->
+                                val apk = choice == UpdateLinkPolicy.Choice.APK
+                                val link = if (apk) info.apkUrl ?: info.releaseUrl else info.releaseUrl
+                                AppLog.i("SettingsFragment: opening update link (${if (apk) "apk" else "release page"}) $link")
+                                UpdateChecker.openGitHubReleases(ctx, link)
+                            }
+                            val label = { choice: UpdateLinkPolicy.Choice ->
+                                if (choice == UpdateLinkPolicy.Choice.APK) R.string.download_apk else R.string.open_github_releases
+                            }
+                            builder.setPositiveButton(label(primary)) { _, _ -> open(primary) }
+                            if (secondary != null) {
+                                builder.setNeutralButton(label(secondary)) { _, _ -> open(secondary) }
+                            }
+                        }
+                        builder.show()
+                    } else {
+                        MaterialAlertDialogBuilder(ctx, R.style.DarkAlertDialog)
+                            .setTitle(R.string.update_not_available_title)
+                            .setMessage(getString(R.string.update_not_available_message, info.currentVersionName))
+                            .setPositiveButton(android.R.string.ok, null)
+                            .show()
+                    }
+                },
+                onFailure = {
+                    MaterialAlertDialogBuilder(ctx, R.style.DarkAlertDialog)
+                        .setTitle(R.string.check_for_updates)
+                        .setMessage(R.string.update_check_failed)
+                        .setPositiveButton(android.R.string.ok, null)
+                        .show()
+                }
+            )
+        }
     }
 }

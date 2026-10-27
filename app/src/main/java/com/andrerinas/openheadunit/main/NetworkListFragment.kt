@@ -22,6 +22,7 @@ import androidx.recyclerview.widget.RecyclerView
 import android.content.Intent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.andrerinas.openheadunit.connection.ConnectionPriorityPolicy
 import com.andrerinas.openheadunit.App
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -30,6 +31,7 @@ import com.andrerinas.openheadunit.aap.AapService
 import com.andrerinas.openheadunit.connection.wifi.NetworkDiscovery
 import com.andrerinas.openheadunit.utils.AppLog
 import com.andrerinas.openheadunit.utils.Settings
+import com.andrerinas.openheadunit.utils.ToastUtils
 import com.andrerinas.openheadunit.utils.changeLastBit
 import com.andrerinas.openheadunit.utils.toInetAddress
 import com.google.android.material.appbar.MaterialToolbar
@@ -167,7 +169,7 @@ class NetworkListFragment : Fragment(), NetworkDiscovery.Listener {
             // Auto-connect to the first found device during a manual scan
             if (scanDialog?.isShowing == true) {
                 scanDialog?.dismiss()
-                Toast.makeText(context, getString(R.string.found_connecting, ip), Toast.LENGTH_SHORT).show()
+                ToastUtils.showToast(context, getString(R.string.found_connecting, ip), Toast.LENGTH_SHORT)
 
                 val ctx = context ?: return@runOnUiThread
                 (activity as? MainActivity)?.beginAutoConnect(
@@ -176,9 +178,9 @@ class NetworkListFragment : Fragment(), NetworkDiscovery.Listener {
                 )
                 lifecycleScope.launch(Dispatchers.IO) {
                     if (socket != null && socket.isConnected)
-                        App.provide(ctx).commManager.connect(socket)
+                        App.provide(ctx).commManager.connect(socket, ConnectionPriorityPolicy.Tier.USER, restartEndpoint = ip to port)
                     else
-                        App.provide(ctx).commManager.connect(ip, 5277)
+                        App.provide(ctx).commManager.connect(ip, 5277, ConnectionPriorityPolicy.Tier.USER)
                     ContextCompat.startForegroundService(ctx, Intent(ctx, AapService::class.java).apply {
                         action = AapService.ACTION_CONNECT_SOCKET
                     })
@@ -197,7 +199,7 @@ class NetworkListFragment : Fragment(), NetworkDiscovery.Listener {
             if (scanDialog?.isShowing == true) {
                 scanDialog?.dismiss()
                 if (adapter.addressList.size <= 2) { // Only localhost and current IP
-                    Toast.makeText(context, getString(R.string.no_devices_found), Toast.LENGTH_SHORT).show()
+                    ToastUtils.showToast(context, getString(R.string.no_devices_found), Toast.LENGTH_SHORT, force = true)
                 }
             }
         }
@@ -330,7 +332,7 @@ class NetworkListFragment : Fragment(), NetworkDiscovery.Listener {
                 ContextCompat.startForegroundService(context, Intent(context, AapService::class.java).apply {
                     action = AapService.ACTION_CONNECT_SOCKET
                 })
-                scope.launch(Dispatchers.IO) { App.provide(context).commManager.connect(ip, 5277) }
+                scope.launch(Dispatchers.IO) { App.provide(context).commManager.connect(ip, 5277, ConnectionPriorityPolicy.Tier.USER) }
             } else {
                 this.removeAddress(v.getTag(R.integer.key_data) as String)
             }

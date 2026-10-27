@@ -1,6 +1,5 @@
 package com.andrerinas.openheadunit.main
 
-import android.content.Intent
 import android.media.AudioManager
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -8,18 +7,17 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
-import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.navigation.fragment.findNavController
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.R
-import com.andrerinas.openheadunit.aap.AapService
 import com.andrerinas.openheadunit.main.settings.SettingItem
 import com.andrerinas.openheadunit.main.settings.SettingsAdapter
 import com.andrerinas.openheadunit.utils.AudioStreamTester
 import com.andrerinas.openheadunit.utils.Settings
+import com.andrerinas.openheadunit.utils.ToastUtils
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
@@ -118,22 +116,22 @@ class AudioStreamSettingsFragment : Fragment() {
     }
 
     private fun saveSettings() {
-        pendingSeparateAudioStreams?.let { settings.separateAudioStreams = it }
-        pendingMediaAudioStream?.let { settings.mediaAudioStream = it }
-        pendingGuidanceAudioStream?.let { settings.guidanceAudioStream = it }
-        pendingSystemAudioStream?.let { settings.systemAudioStream = it }
+        pendingSeparateAudioStreams?.let { if (it != settings.separateAudioStreams) settings.separateAudioStreams = it }
+        pendingMediaAudioStream?.let { if (it != settings.mediaAudioStream) settings.mediaAudioStream = it }
+        pendingGuidanceAudioStream?.let { if (it != settings.guidanceAudioStream) settings.guidanceAudioStream = it }
+        pendingSystemAudioStream?.let { if (it != settings.systemAudioStream) settings.systemAudioStream = it }
 
-        if (App.provide(requireContext()).commManager.isConnected) {
-            Toast.makeText(context, getString(R.string.stopping_service), Toast.LENGTH_SHORT).show()
-            val stopServiceIntent = Intent(requireContext(), AapService::class.java).apply {
-                action = AapService.ACTION_STOP_SERVICE
-            }
-            ContextCompat.startForegroundService(requireContext(), stopServiceIntent)
-        }
+        settings.commit()
+        val manager = App.provide(requireContext()).commManager
+        val connected = manager.isConnected
+        manager.applyAudioSettings()
+        val sessionEnded = connected && !manager.isConnected
 
         hasChanges = false
         updateSaveButtonState()
-        Toast.makeText(context, getString(R.string.settings_saved), Toast.LENGTH_SHORT).show()
+        ToastUtils.showToast(context,
+            getString(if (sessionEnded) R.string.audio_settings_reconnect else R.string.settings_saved),
+            if (sessionEnded) Toast.LENGTH_LONG else Toast.LENGTH_SHORT, force = true)
     }
 
     private fun checkChanges() {

@@ -14,7 +14,47 @@ import com.andrerinas.openheadunit.utils.AppLog
 
 object SystemUI {
 
-    fun apply(window: Window, root: View, mode: Settings.FullscreenMode, onInsetsChanged: (() -> Unit)? = null) {
+    /**
+     * Keeps immersive full screen hidden on API 16 to 18, after [apply]: those versions have no
+     * sticky immersive mode, so once a touch brings the navigation bar back it stays over the edge
+     * of the window. The bars hide again after [LegacyImmersivePolicy.REHIDE_DELAY_MS]. Does
+     * nothing from API 19, where sticky immersive does this itself. The projection screen keeps its
+     * own version of this, which also rescales the video.
+     */
+    fun keepLegacyBarsHidden(window: Window, mode: Settings.FullscreenMode) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) return
+        val decor = window.decorView
+        if (!LegacyImmersivePolicy.applies(Build.VERSION.SDK_INT, mode)) {
+            decor.setOnSystemUiVisibilityChangeListener(null)
+            return
+        }
+        val hiddenFlags = decor.systemUiVisibility
+        val rehide = Runnable { decor.systemUiVisibility = hiddenFlags }
+        decor.setOnSystemUiVisibilityChangeListener { visibility ->
+            if (LegacyImmersivePolicy.barsShown(visibility)) {
+                decor.removeCallbacks(rehide)
+                decor.postDelayed(rehide, LegacyImmersivePolicy.REHIDE_DELAY_MS)
+            }
+        }
+    }
+
+    /**
+     * [notesCanvas] false for a window that is not the projection, so it cannot describe a canvas
+     * the video will never be drawn into.
+     */
+    fun apply(
+        window: Window,
+        root: View,
+        mode: Settings.FullscreenMode,
+        notesCanvas: Boolean = true,
+        onInsetsChanged: (() -> Unit)? = null,
+    ) {
+        applySystemBars(window, mode)
+        applyInsets(window, root, mode, notesCanvas, onInsetsChanged)
+    }
+
+    /** Configures dialog windows without changing the projection's canvas or manual insets. */
+    fun applySystemBars(window: Window, mode: Settings.FullscreenMode) {
         // Always keep screen on for Headunit functionality
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
@@ -107,7 +147,15 @@ object SystemUI {
             controllerCompat.isAppearanceLightStatusBars = false
             controllerCompat.isAppearanceLightNavigationBars = false
         }
+    }
 
+    private fun applyInsets(
+        window: Window,
+        root: View,
+        mode: Settings.FullscreenMode,
+        notesCanvas: Boolean,
+        onInsetsChanged: (() -> Unit)?,
+    ) {
         val settings = Settings(root.context)
 
         // IMMEDIATE APPLICATION OF MANUAL INSETS
@@ -115,6 +163,11 @@ object SystemUI {
         val manualT = settings.insetTop
         val manualR = settings.insetRight
         val manualB = settings.insetBottom
+
+        // Read before the line below re-seeds the insets: until it runs, the content area and the
+        // insets in force describe the same layout, and afterwards one half of the pair is stale.
+        val canvasView = if (notesCanvas) (window.decorView.findViewById<View>(android.R.id.content) ?: root) else null
+        canvasView?.let { noteContentSize(it) }
 
         root.setPadding(manualL, manualT, manualR, manualB)
         HeadUnitScreenConfig.updateInsets(manualL, manualT, manualR, manualB)
@@ -197,5 +250,29 @@ object SystemUI {
 
         ViewCompat.requestApplyInsets(root)
         root.requestLayout()
+
+        canvasView?.let { watchCanvas(it) }
     }
+
+    /**
+     * Report this window's content area as the canvas for the current screen mode. Service
+     * discovery answers before any projection surface exists, so without this the first session in
+     * a mode announces a pixel shape measured from the display instead of the window.
+     */
+    private fun watchCanvas(content: View) {
+        // apply() runs again on every focus change, so the watch is installed once per view and
+        // left in place: a one-shot would latch whatever the insets happened to be that frame.
+        if (canvasWatched.put(content, true) != null) return
+        content.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ -> noteContentSize(v) }
+    }
+
+    /** A window shrunk by the soft keyboard is not the canvas the projection will get. */
+    private fun noteContentSize(content: View) {
+        if (content.width <= 0 || content.height <= 0) return
+        val ime = ViewCompat.getRootWindowInsets(content)?.getInsets(WindowInsetsCompat.Type.ime())
+        if (ime != null && (ime.bottom > 0 || ime.top > 0)) return
+        HeadUnitScreenConfig.noteWindowContent(content.width, content.height)
+    }
+
+    private val canvasWatched = java.util.WeakHashMap<View, Boolean>()
 }

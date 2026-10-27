@@ -1,6 +1,5 @@
 package com.andrerinas.openheadunit.connection.projection
 
-import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
@@ -29,6 +28,9 @@ class StandardUsbProjectionConnection(usbMgr: UsbManager, device: UsbDevice) :
     private var internalBufferAvailable = 0
 
     override val type = ProjectionConnection.Type.USB
+
+    override val outMaxPacketSize: Int
+        get() = endpointOut?.maxPacketSize ?: 0
 
     override val isConnected: Boolean
         get() = usbDeviceConnected != null
@@ -115,19 +117,11 @@ class StandardUsbProjectionConnection(usbMgr: UsbManager, device: UsbDevice) :
 
     private fun initEndpoint(): Int {
         AppLog.i("Check accessory endpoints")
-        endpointIn = null
-        endpointOut = null
-
-        for (i in 0 until usbInterface!!.endpointCount) {
-            val ep = usbInterface!!.getEndpoint(i)
-            if (ep.direction == UsbConstants.USB_DIR_IN) {
-                if (endpointIn == null) endpointIn = ep
-            } else {
-                if (endpointOut == null) endpointOut = ep
-            }
-        }
+        val (selectedIn, selectedOut) = UsbDeviceCompat.selectEndpoints(usbInterface!!)
+        endpointIn = selectedIn
+        endpointOut = selectedOut
         if (endpointIn == null || endpointOut == null) {
-            AppLog.e("Unable to find bulk endpoints")
+            AppLog.e("Unable to find an endpoint pair on the accessory interface")
             return -1
         }
 
@@ -162,9 +156,14 @@ class StandardUsbProjectionConnection(usbMgr: UsbManager, device: UsbDevice) :
     override fun disconnect() {
         // close() is thread-safe and immediately aborts any in-flight bulkTransfer(),
         // so both sendBlocking and recvBlocking unblock within milliseconds.
-        usbDeviceConnection?.close()
+        val earlyClosed = usbDeviceConnection
+        earlyClosed?.close()
 
         synchronized(stateLock) {
+            // openDevice can publish a handle while we wait for this lock. The early close
+            // only interrupted the old handle; close a late one before dropping its reference.
+            val retiring = usbDeviceConnection
+            if (retiring !== earlyClosed) retiring?.close()
             if (usbDeviceConnected != null) {
                 AppLog.i(usbDeviceConnected!!.toString())
             }

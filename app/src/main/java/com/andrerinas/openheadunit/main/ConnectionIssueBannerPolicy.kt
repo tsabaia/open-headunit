@@ -14,6 +14,18 @@ import com.andrerinas.openheadunit.utils.StandingIssue
  */
 object ConnectionIssueBannerPolicy {
 
+    /**
+     * What either Native transport can raise. Kept apart from the per-transport extras because
+     * both lists had to be edited by hand for every record belonging to both, and one was missed.
+     */
+    private val EITHER_NATIVE_TRANSPORT = setOf(
+        ConnectionIssue.BLUETOOTH_SENT_NO_DATA,
+        ConnectionIssue.VIDEO_LINK_TOO_SLOW,
+        ConnectionIssue.HANDS_FREE_HELD_ELSEWHERE,
+        ConnectionIssue.HANDS_FREE_RECORD_REFUSED,
+        ConnectionIssue.PHONE_HOLDS_STALE_ENDPOINT
+    )
+
     /** [com.andrerinas.openheadunit.utils.Settings.wifiConnectionMode] for Native AA wireless. */
     private const val NATIVE_AA_MODE = 3
 
@@ -31,20 +43,54 @@ object ConnectionIssueBannerPolicy {
      *   Native AA hotspot transport ever constructs. Helper strategy 4 rides its own access point
      *   too but never resolves credentials from it, so it cannot raise this and does not appear
      *   here — which is also why this takes no `helperConnectionStrategy`: no rule uses it.
+     * - `WIFI_DIRECT_GROUP_REFUSED` is raised in `WifiDirectManager` on the branch that gives up on
+     *   group creation, which only the Native AA WiFi Direct transport reaches. The helper's own
+     *   WiFi Direct strategy shares that manager but hands the phone no credentials, so a refused
+     *   group there is not the reason a connection failed.
+     * - `WIFI_DIRECT_STACK_CYCLED` is raised in the same manager's state receiver and is the cause
+     *   the refusal above is usually the symptom of, so it is keyed the same way.
+     * - `WIFI_RADIO_OFF` is raised on the branch above both of those, where the radio is off and the
+     *   platform refuses to switch it on, so no group is ever asked for. Same transport, same key.
+     * - `HANDS_FREE_HELD_ELSEWHERE` is raised by the wake poke in `NativeAaHandshakeManager`, which
+     *   only runs in Native AA but runs on both of its transports, so it is keyed to both.
+     * - `HANDS_FREE_RECORD_REFUSED` is raised where that manager opens its listeners, which is the
+     *   same mode on the same two transports, so it is keyed the same way.
+     * - `HOME_WIFI_REJOINED_BESIDE_GROUP` is raised in `StationStandDown`, which only stands the
+     *   station down for a Native AA WiFi Direct group.
+     * - `STALE_USB_ACCESSORY` is raised in `UsbLauncherManager` once both recovery steps fail. USB
+     *   runs in every wireless mode and on a cable-only unit, so it is keyed to all of them.
      *
      * A record is not deleted when it stops applying. It describes what the hardware did, and the
      * user may well be back on that route tomorrow; it is only hidden while it cannot be the
      * reason the last attempt failed.
      */
-    fun relevantNow(mode: Int, transport: NativeTransport): Set<ConnectionIssue> {
-        if (mode != NATIVE_AA_MODE) return emptySet()
-        return when (transport) {
-            NativeTransport.WIFI_DIRECT -> setOf(
-                ConnectionIssue.BLUETOOTH_SENT_NO_DATA,
-                ConnectionIssue.BSSID_UNAVAILABLE
+    fun relevantNow(
+        mode: Int,
+        transport: NativeTransport,
+        wirelessSelected: Boolean,
+    ): Set<ConnectionIssue> {
+        // Keyed on its endpoint rather than on a mode or on wireless being chosen: it is raised
+        // only when the peer we dialled was Android Auto's own head unit server, so its presence
+        // already proves the route that produces it ran. Self Mode reaches it either way.
+        val anyMode = setOf(
+            ConnectionIssue.HEADUNIT_SERVER_NOT_ANSWERING,
+            ConnectionIssue.STALE_USB_ACCESSORY
+        )
+        // A cable-only unit never brings the wireless stack up, so none of the rest can be the
+        // reason its last attempt failed, however recently the record was written.
+        if (!wirelessSelected) return anyMode
+        if (mode != NATIVE_AA_MODE) return anyMode
+        return anyMode + when (transport) {
+            NativeTransport.WIFI_DIRECT -> EITHER_NATIVE_TRANSPORT + setOf(
+                ConnectionIssue.BSSID_UNAVAILABLE,
+                ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED,
+                ConnectionIssue.WIFI_DIRECT_STACK_CYCLED,
+                ConnectionIssue.WIFI_DIRECT_STACK_STUCK,
+                ConnectionIssue.WIFI_RADIO_OFF,
+                ConnectionIssue.FIVE_GHZ_CHANNEL_REFUSED,
+                ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP
             )
-            NativeTransport.HOTSPOT -> setOf(
-                ConnectionIssue.BLUETOOTH_SENT_NO_DATA,
+            NativeTransport.HOTSPOT -> EITHER_NATIVE_TRANSPORT + setOf(
                 ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE,
                 ConnectionIssue.HOTSPOT_NOT_RUNNING
             )
@@ -56,8 +102,8 @@ object ConnectionIssueBannerPolicy {
      * that has already been done.
      *
      * These records are cleared only by something that *disproves* them, which the user typing a
-     * value never does: the device that would not name its own access point still will not, and the
-     * unit that could not read its own address still cannot. So a user who typed the hotspot name
+     * value never does: the device that would not name its own access point still will not, and a
+     * unit whose every source came back empty is not made to read one by a value typed into a box. So a user who typed the hotspot name
      * the banner asked for, and whose access point then happens to be off at the next launch, would
      * be told again to enter it by hand. The record stays; the instruction stops.
      *
@@ -68,8 +114,22 @@ object ConnectionIssueBannerPolicy {
      * that every state one of them declines to retire is one this function hides.
      *
      * `BLUETOOTH_SENT_NO_DATA` has no entry because its remedy is leaving Native AA, which
-     * [relevantNow] already answers. `HOTSPOT_NOT_RUNNING` has none either: no setting fixes it,
-     * and switching the access point on disproves it outright, so the record retires itself.
+     * [relevantNow] already answers. `HOTSPOT_NOT_RUNNING`, `WIFI_DIRECT_GROUP_REFUSED`,
+     * `WIFI_DIRECT_STACK_CYCLED`, `FIVE_GHZ_CHANNEL_REFUSED` and `VIDEO_LINK_TOO_SLOW` have none
+     * either: no setting fixes them, and an access point coming up, a group forming or a session
+     * rendering a frame disproves them outright, so those records retire themselves. The channel
+     * one is retired by a narrower event than the rest - a group formed *on the channel that was
+     * asked for*, since one on the driver's own pick is the failure it describes. Lowering the
+     * frame rate is deliberately not a remedy here: it is a guess at the ceiling, and only a
+     * session that renders proves it was enough. `HEADUNIT_SERVER_NOT_ANSWERING` has no entry
+     * either: its remedy is on the phone, and a handshake that completes disproves it.
+     * `HANDS_FREE_HELD_ELSEWHERE` has none for the same shape of reason: the lever is the other
+     * device, and the next wake pass that reads the link free retires it.
+     * `PHONE_HOLDS_STALE_ENDPOINT` has none either: the record lives on the phone, no setting here
+     * reaches it, and a dial this unit serves disproves it. `HANDS_FREE_RECORD_REFUSED` has none
+     * because it is this unit's own Bluetooth stack refusing, and a registration that succeeds on a
+     * later arming retires it. `HOME_WIFI_REJOINED_BESIDE_GROUP` has none: its lever is in Android's
+     * WiFi settings, and a stand-down that holds through a session retires it.
      *
      * @param hotspotSsid [com.andrerinas.openheadunit.utils.Settings.hotspotSsid]
      * @param hotspotPassword [com.andrerinas.openheadunit.utils.Settings.hotspotPassword] — needed
@@ -79,17 +139,21 @@ object ConnectionIssueBannerPolicy {
      *   [com.andrerinas.openheadunit.aap.SoftApCredentialsPolicy.resolve].
      * @param staticBssid [com.andrerinas.openheadunit.utils.Settings.staticBSSID], judged by the
      *   same predicate the handshake uses, so a value the chain would discard is not a remedy.
+     * @param staticP2pBssid [com.andrerinas.openheadunit.utils.Settings.staticP2pBSSID]. Either
+     *   address answers the record, which is about this unit not reading its own: the user only
+     *   types the one for the transport they run.
      */
     fun remedyApplied(
         hotspotSsid: String,
         hotspotPassword: String,
-        staticBssid: String?
+        staticBssid: String?,
+        staticP2pBssid: String? = null
     ): Set<ConnectionIssue> {
         val applied = mutableSetOf<ConnectionIssue>()
         if (hotspotSsid.isNotEmpty() && hotspotPassword.isNotEmpty()) {
             applied.add(ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE)
         }
-        if (SoftApBssidPolicy.isUsable(staticBssid)) {
+        if (SoftApBssidPolicy.isUsable(staticBssid) || SoftApBssidPolicy.isUsable(staticP2pBssid)) {
             applied.add(ConnectionIssue.BSSID_UNAVAILABLE)
         }
         return applied
@@ -129,16 +193,21 @@ object ConnectionIssueBannerPolicy {
         //
         // One at a time rather than a list: these panels are commonly 1024x600 and often 800x480,
         // and three stacked warnings would be the screen.
-        val newest = standing
+        //
+        // Dismissal is per occurrence, not permanent. Hiding what the user has already read costs
+        // nothing; hiding the next failure too would make the banner useless on the second drive.
+        // Filtered before the ranking, so a dismissed record can never hide a newer one.
+        val candidates = standing
             .filter { it.raisedAtEpochMs != 0L }
             .filter { it.issue in relevant }
             .filter { it.issue !in remedyApplied }
-            .maxByOrNull { it.raisedAtEpochMs }
-            ?: return null
-
-        // Dismissal is per occurrence, not permanent. Hiding what the user has already read costs
-        // nothing; hiding the next failure too would make the banner useless on the second drive.
-        if (newest.raisedAtEpochMs <= dismissedAtEpochMs) return null
+            .filter { it.raisedAtEpochMs > dismissedAtEpochMs }
+        val newest = candidates.maxByOrNull { it.raisedAtEpochMs } ?: return null
+        // The one exception to newest-wins: a wedged stack causes the refusal re-raised on every
+        // failed create, so that symptom must not hide the banner carrying the remedy. Only that.
+        if (newest.issue == ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED &&
+            candidates.any { it.issue == ConnectionIssue.WIFI_DIRECT_STACK_STUCK }
+        ) return ConnectionIssue.WIFI_DIRECT_STACK_STUCK
 
         return newest.issue
     }

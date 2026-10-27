@@ -4,6 +4,8 @@ import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
+import com.andrerinas.openheadunit.connection.ConnectionStage
+import com.andrerinas.openheadunit.connection.ConnectionStageTracker
 import com.andrerinas.openheadunit.utils.Utils
 import com.andrerinas.openheadunit.utils.AppLog
 
@@ -27,12 +29,16 @@ class UsbAccessoryMode(private val usbMgr: UsbManager) {
             AppLog.i("UsbAccessoryMode: Performing AOA switch via native libusb...")
             val native = UsbNative()
             if (native.wrap(connection, 0, 0)) {
-                val switchResult = native.accModeSwitch() == 0
+                val code = native.accModeSwitch()
                 native.close()
-                switchResult
+                // The code only reaches raw logcat from the native side, and an APPLOG_FILE export
+                // carries none of it. Say what it means where the reporter's log will have it.
+                if (code != 0) AppLog.w(AoaSwitchFailurePolicy.failureLine(code))
+                code == 0
             } else {
                 AppLog.e("UsbAccessoryMode: Failed to wrap device for native AOA switch")
                 native.close()
+                AppLog.w(AoaSwitchFailurePolicy.failureLine(AoaSwitchFailurePolicy.NO_HANDLE))
                 false
             }
         } else {
@@ -44,12 +50,40 @@ class UsbAccessoryMode(private val usbMgr: UsbManager) {
         return result
     }
 
+    /** Resets the device on the bus through libusb; true when the reset was issued. */
+    fun resetDevice(device: UsbDevice): Boolean {
+        val name = UsbDeviceCompat(device).uniqueName
+        val connection = try { usbMgr.openDevice(device) } catch (e: Throwable) {
+            AppLog.e("UsbAccessoryMode: USB reset not issued to $name: cannot open", e)
+            return false
+        }
+        if (connection == null) {
+            AppLog.w("UsbAccessoryMode: USB reset not issued to $name: cannot open")
+            return false
+        }
+        val native = UsbNative()
+        val wrapped = native.wrap(connection, 0, 0)
+        if (wrapped) native.reset()
+        native.close()
+        connection.close()
+        if (wrapped) AppLog.i("UsbAccessoryMode: USB reset issued to $name")
+        else AppLog.w("UsbAccessoryMode: USB reset not issued to $name: cannot wrap for libusb")
+        return wrapped
+    }
+
     private fun switch(connection: UsbDeviceConnection): Boolean {
         // Do accessory negotiation and attempt to switch to accessory mode. Called only by usb_connect()
         val buffer = ByteArray(2)
         var len = connection.controlTransfer(UsbConstants.USB_DIR_IN or UsbConstants.USB_TYPE_VENDOR, ACC_REQ_GET_PROTOCOL, 0, 0, buffer, 2, USB_TIMEOUT_IN_MS)
         if (len != 2) {
             AppLog.e("Error controlTransfer len: $len")
+            // controlTransfer returns -1 for a stall and for a timeout alike, so name both. A
+            // device that answers neither is not offering Android Auto over USB.
+            AppLog.w(
+                "UsbAccessoryMode: AOA switch failed: the device did not complete the Android " +
+                    "Auto handshake (stalled or no answer), so it is not offering Android Auto " +
+                    "over USB"
+            )
             return false
         }
         val acc_ver = Utils.getAccVersion(buffer)
@@ -82,6 +116,7 @@ class UsbAccessoryMode(private val usbMgr: UsbManager) {
         // len < 0: phone disconnected before the ACK because it started re-enumerating
         //          immediately upon receipt — the command was still received. Treat as success.
         AppLog.i("Acc start sent (len=$len). Waiting for re-enumeration...")
+        ConnectionStageTracker.report(ConnectionStage.USB_SWITCHING)
         try { Thread.sleep(500) } catch (e: Exception) {}
         return true
     }
@@ -107,7 +142,12 @@ class UsbAccessoryMode(private val usbMgr: UsbManager) {
     }
 
     companion object {
-        private const val USB_TIMEOUT_IN_MS = 100
+        /**
+         * 100 ms was under USB 2.0's own 500 ms allowance for the first data packet, so a slow
+         * phone read as "not an AOA device". 1000 is what the native path (`usbhelper.c`) and the
+         * other AOAP implementations use, and the timeout only bounds a device that is not replying.
+         */
+        private const val USB_TIMEOUT_IN_MS = 1000
         private const val MANUFACTURER = "Android"
         private const val MODEL = "Android Auto"
         private const val DESCRIPTION = "Android Auto"//"Android Open Automotive Protocol"

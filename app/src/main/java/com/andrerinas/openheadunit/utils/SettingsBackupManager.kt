@@ -44,19 +44,33 @@ object SettingsBackupManager {
         val changedKeys: Set<String>
     )
 
-    private enum class ValueType {
+    internal enum class ValueType {
         BOOLEAN,
         INT,
         STRING,
         STRING_SET
     }
 
-    private val backupKeys = linkedMapOf(
+    internal val backupKeys = linkedMapOf(
         "allow-devices" to ValueType.STRING_SET,
         "network-addresses" to ValueType.STRING_SET,
         "bt-address" to ValueType.STRING,
+        "bt-announce" to ValueType.STRING,
         "resolutionId" to ValueType.INT,
+        "video-fit-mode" to ValueType.INT,
+        // Older backups carry the boolean this replaced. parseImportJson drops keys it does
+        // not know, so without this an old backup loses the setting; Settings.videoFitMode
+        // migrates the restored boolean on first read.
         "stretch_to_fill" to ValueType.BOOLEAN,
+        "enable-car-launcher" to ValueType.BOOLEAN,
+        "enable-floating-button" to ValueType.BOOLEAN,
+        "floating-button-connection-status-mode" to ValueType.BOOLEAN,
+        "floating-button-x-percent" to ValueType.INT,
+        "floating-button-y-percent" to ValueType.INT,
+        "floating-button-opacity-percent" to ValueType.INT,
+        "floating-button-disconnected-opacity-percent" to ValueType.INT,
+        "floating-button-size-dp" to ValueType.INT,
+        "aa-exit-action" to ValueType.INT,
         "forced_scale" to ValueType.BOOLEAN,
         "hud_mirroring" to ValueType.BOOLEAN,
         "ui-scale-home-percent" to ValueType.INT,
@@ -70,9 +84,25 @@ object SettingsBackupManager {
         "night-mode-threshold-brightness" to ValueType.INT,
         "key-codes" to ValueType.STRING_SET,
         Settings.KEY_LOG_LEVEL to ValueType.INT,
+        // Where the log comes from and where it lands. A round that asks for a particular capture
+        // has to be able to seed these the same way it seeds the level.
+        Settings.KEY_LOG_SOURCE to ValueType.INT,
+        Settings.KEY_LOG_LOCATION to ValueType.INT,
+        // Lets an automation tool configure this unit at all, so it has to survive a reinstall or
+        // the tool goes silent with no indication why.
+        Settings.KEY_ALLOW_EXTERNAL_CONFIGURATION to ValueType.BOOLEAN,
+        // The video fault injector and its dosage. Not user settings, but a test round sets them
+        // per arm, and carrying them is what lets a whole arm be written in one call.
+        "debug-video-fault-injection" to ValueType.INT,
+        "debug-video-fault-rate" to ValueType.INT,
+        "debug-video-fault-budget" to ValueType.INT,
+        "debug-video-low-latency" to ValueType.BOOLEAN,
+        "debug-video-feed-hold-ms" to ValueType.INT,
+        "debug-force-memory-profile" to ValueType.STRING,
         "view-mode" to ValueType.INT,
         Settings.KEY_SCREEN_ORIENTATION to ValueType.INT,
         "dpi-pixel-density" to ValueType.INT,
+        "display-size-preset" to ValueType.STRING,
         "pixel-aspect-ratio-e4" to ValueType.INT,
         "fake_speed" to ValueType.BOOLEAN,
         "inset-left" to ValueType.INT,
@@ -117,6 +147,7 @@ object SettingsBackupManager {
         "use-head-unit-microphone" to ValueType.BOOLEAN,
         "mic-input-source" to ValueType.INT,
         "audio-latency-multiplier" to ValueType.INT,
+        "audio-matching-mode" to ValueType.STRING,
         "audio-queue-capacity" to ValueType.INT,
         "use-aac-audio" to ValueType.BOOLEAN,
         "mic-echo-canceler" to ValueType.BOOLEAN,
@@ -136,6 +167,10 @@ object SettingsBackupManager {
         "auto-connect-priority-order" to ValueType.STRING,
         "auto-start-bt-macs" to ValueType.STRING_SET,
         "auto-start-bt-name" to ValueType.STRING,
+        "auto-disconnect-bt-macs" to ValueType.STRING_SET,
+        "native-poke-bt-macs" to ValueType.STRING_SET,
+        "native-poke-all-paired" to ValueType.BOOLEAN,
+        "auto-disconnect-bt-delay-seconds" to ValueType.INT,
         "app-language" to ValueType.STRING,
         "media-volume-offset" to ValueType.INT,
         "assistant-volume-offset" to ValueType.INT,
@@ -147,6 +182,8 @@ object SettingsBackupManager {
         "app-theme-manual-start" to ValueType.INT,
         "app-theme-manual-end" to ValueType.INT,
         "show-fps-counter" to ValueType.BOOLEAN,
+        "overlay-position" to ValueType.INT,
+        "overlay-fields" to ValueType.INT,
         "monochrome-icons" to ValueType.BOOLEAN,
         "auto-monochrome-buttons-at-night" to ValueType.BOOLEAN,
         "home-background-night-mode" to ValueType.INT,
@@ -162,9 +199,12 @@ object SettingsBackupManager {
         "wait-for-wifi-timeout" to ValueType.INT,
         "helper-connection-strategy" to ValueType.INT,
         "bluetooth-manager-service-name" to ValueType.STRING,
-        // The Native AA handshake opt-in: a reporter who found they need it wants it to survive a
-        // reinstall, which is exactly when they are asked to export their settings.
-        "native-wifi-version-exchange" to ValueType.BOOLEAN,
+        // On by default, so what is worth carrying is the opt-out: a user who turned it off should
+        // not have to find it again after a reinstall.
+        // The mode itself is carried, so leaving this behind would restore Native AA onto a
+        // flagged unit in the one state where it refuses to start, and the row that turns it back
+        // on renders only on flagged units.
+        "native-aa-ignore-external-bt" to ValueType.BOOLEAN,
         // Selectable from the Android Auto mode block now that the route is wired.
         "native-ap-transport" to ValueType.INT,
         "hotspot-interface" to ValueType.STRING,
@@ -179,20 +219,30 @@ object SettingsBackupManager {
         // Wireless hotspot host credentials and manual BSSID override.
         "hotspot-ssid" to ValueType.STRING,
         "hotspot-password" to ValueType.STRING,
+        // The WiFi Direct pair, for the same reason: the user typed it and a reinstall is exactly
+        // when they want it back. No half-pair guard is needed because Settings.wifiDirectGroupIdentity
+        // reads null unless both keys are present, and a fresh pair is then minted.
+        "wifi-direct-group-name" to ValueType.STRING,
+        "wifi-direct-group-passphrase" to ValueType.STRING,
+        "wifi-direct-identity-user-set" to ValueType.BOOLEAN,
         // Which band to ask for, on either transport: a property of this unit's radio, found by
         // trial, so it should survive the reinstall that is exactly when somebody exports their
         // settings.
         "hotspot-band" to ValueType.INT,
         "wifi-direct-band" to ValueType.INT,
+        // And which channel within the 5 GHz band, which is a property of the user's phone and
+        // regulatory domain rather than of this unit, so it is worth even more across a reinstall.
+        "wifi-5ghz-channel" to ValueType.INT,
         "static-bssid" to ValueType.STRING,
+        "static-p2p-bssid" to ValueType.STRING,
         // Touch calibration fix and toast visibility.
-        "use_measured_touch_surface" to ValueType.BOOLEAN,
         "show-toast-messages" to ValueType.BOOLEAN,
         "usb-blacklist" to ValueType.STRING_SET
     )
 
     private val projectionRestartKeys = setOf(
         "resolutionId",
+        "video-fit-mode",
         "video-codec",
         "fps-limit",
         "dpi-pixel-density",
@@ -483,6 +533,7 @@ object SettingsBackupManager {
         Settings.syncAutoStartWifiSsidToDeviceStorage(context, settings.autoStartWifiSsid)
         Settings.syncListenForUsbDevicesToDeviceStorage(context, settings.listenForUsbDevices)
         Settings.syncAutoStartBtMacsToDeviceStorage(context, settings.autoStartBluetoothDeviceMacs)
+        Settings.syncUsbBlacklistToDeviceStorage(context, settings.usbBlacklist)
         Settings.setUsbAttachedActivityEnabled(context, settings.listenForUsbDevices)
         AppThemeManager.reapply(context, settings)
     }

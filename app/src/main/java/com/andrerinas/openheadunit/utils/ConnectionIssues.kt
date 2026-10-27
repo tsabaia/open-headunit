@@ -31,7 +31,117 @@ enum class ConnectionIssue {
      * The commonest way the hotspot route fails and, until now, the quietest: the resolve loop said
      * so once per run into a log that a busy unit drops, and nothing anywhere carried it afterwards.
      */
-    HOTSPOT_NOT_RUNNING
+    HOTSPOT_NOT_RUNNING,
+
+    /**
+     * The platform would not create a WiFi Direct group, so there was no network to hand the phone.
+     *
+     * Distinct from the two hotspot records in that no setting reaches it: the refusal is the unit's
+     * radio saying it cannot be a group owner right now, most often because it is already an
+     * associated station on some other network. The user's levers are leaving that network or
+     * switching the Native transport to the head unit's own access point.
+     */
+    WIFI_DIRECT_GROUP_REFUSED,
+
+    /**
+     * Something else on this unit keeps switching WiFi Direct off and on, so no group can form.
+     *
+     * The refusal above is the symptom this produces, and both stand at once when it happens. This
+     * one is separate because its remedy is different in kind: the unit is capable of hosting a
+     * group, and would, if the app cycling the interface out from under it stopped.
+     */
+    WIFI_DIRECT_STACK_CYCLED,
+
+    /**
+     * WiFi Direct is wedged and only a WiFi restart frees it, which the banner performs when root or
+     * local ADB allows. Unlike [WIFI_DIRECT_STACK_CYCLED] no other app is involved: see
+     * [com.andrerinas.openheadunit.connection.wifi.direct.P2pStackWedgePolicy].
+     */
+    WIFI_DIRECT_STACK_STUCK,
+
+    /**
+     * This unit's WiFi is off, and this Android will not let an app switch it on.
+     *
+     * Separate from [WIFI_DIRECT_GROUP_REFUSED], which is a radio that was asked and said no: here
+     * nothing is ever asked, so there is no associated station to go looking for. The user's levers
+     * are switching WiFi on, or the head unit's own access point as the Native transport.
+     */
+    WIFI_RADIO_OFF,
+
+    /**
+     * Sessions keep starting and then ending without a single video frame ever arriving.
+     *
+     * The one verdict about a link that works. The phone joins, the AAP session and SSL complete,
+     * the video channel opens, and the phone closes the socket seconds later having sent nothing:
+     * measured on a 2.4 GHz access point at 1080p/60, where the same access point carried 800x480/30
+     * indefinitely. The user's levers are the frame rate, the resolution, AAC audio, and 5 GHz on a
+     * radio that has it.
+     */
+    VIDEO_LINK_TOO_SLOW,
+
+    /**
+     * The unit refused a group owner on every 5 GHz channel the pinned one was walked across.
+     *
+     * Not the same as [WIFI_DIRECT_GROUP_REFUSED]: a group does form, on whatever channel the
+     * driver picks for itself. That is the failure - the setting exists because the driver's pick
+     * is one the user's phone cannot see, and a phone whose country forbids that channel does not
+     * merely refuse it, it never scans it and so never lists the network at all. The user's lever
+     * is the band, not the channel.
+     */
+    FIVE_GHZ_CHANNEL_REFUSED,
+
+    /**
+     * Android Auto's own head unit server is accepting connections and answering none of them.
+     *
+     * It hands every accepted socket to its car service and waits there with no timeout, so one
+     * peer that went away without closing leaves it deaf to everyone after. Nothing on this side
+     * recovers it; stopping and starting the server on the phone does.
+     */
+    HEADUNIT_SERVER_NOT_ANSWERING,
+
+    /**
+     * Another device holds this unit's hands-free link, so the phone being woken cannot have it.
+     *
+     * The wake still goes out, because the link is not that phone's and nothing of its is taken.
+     * But Android Auto will not start wireless setup against a head unit whose Bluetooth is not
+     * connected with a profile, and a unit serving one hands-free link at a time has none left to
+     * give. No setting reaches it: the lever is the other device.
+     */
+    HANDS_FREE_HELD_ELSEWHERE,
+
+    /**
+     * This unit's Bluetooth would not publish a hands-free record for the app to stand in with.
+     *
+     * Android Auto will not start wireless setup against a head unit whose Bluetooth is not
+     * connected with a profile, and a unit with no such record can never offer one. Asked for
+     * again a few times before this is raised, in case it was the Android Auto record registering
+     * milliseconds earlier. No setting reaches it.
+     */
+    HANDS_FREE_RECORD_REFUSED,
+
+    /**
+     * The phone is dialling a TCP endpoint this unit no longer honours, and cannot be told to stop.
+     *
+     * Android Auto stores that endpoint beside the network it was given and prefers it over the
+     * Bluetooth handshake, with no fallback when the network is gone. This unit turns the dial away
+     * and, where its Bluetooth listeners are open, withdraws the endpoint on the wire. A served
+     * dial retires it, and so does a Bluetooth handshake landing with none beside it, because a
+     * rejection that works is what stops the phone ever dialling again.
+     */
+    PHONE_HOLDS_STALE_ENDPOINT,
+
+    /**
+     * The platform kept rejoining this unit's own WiFi network beside the WiFi Direct group and
+     * the stand-down gave up, so both share one radio and the picture can stutter. The lever is
+     * that network's auto-reconnect, which only Android's WiFi settings reach.
+     */
+    HOME_WIFI_REJOINED_BESIDE_GROUP,
+
+    /**
+     * The phone stayed in accessory mode and answered no handshake after both recovery steps.
+     * Only a replug recovers it now.
+     */
+    STALE_USB_ACCESSORY
 }
 
 /** An issue that is currently true, and when it was last raised. */
@@ -76,6 +186,10 @@ object ConnectionIssues {
         storeFor(context)?.let { raise(it, issue, System.currentTimeMillis()) }
     }
 
+    fun raiseOnce(context: Context, issue: ConnectionIssue) {
+        storeFor(context)?.let { raiseOnce(it, issue, System.currentTimeMillis()) }
+    }
+
     fun clear(context: Context, issue: ConnectionIssue) {
         storeFor(context)?.let { clear(it, issue) }
     }
@@ -92,6 +206,16 @@ object ConnectionIssues {
      */
     fun raise(store: ConnectionIssueStore, issue: ConnectionIssue, nowMs: Long) {
         store.write(issue, nowMs)
+    }
+
+    /**
+     * Record [issue] as true without moving a stamp that is already standing.
+     *
+     * For a condition re-detected on a loop rather than at an event. [raise] would push the stamp
+     * past the user's dismissal on every pass, so the banner could never be dismissed at all.
+     */
+    fun raiseOnce(store: ConnectionIssueStore, issue: ConnectionIssue, nowMs: Long) {
+        if (store.read(issue) == 0L) store.write(issue, nowMs)
     }
 
     /** Safe to call when the issue was never raised. */
@@ -127,6 +251,18 @@ object ConnectionIssues {
                 ConnectionIssue.BSSID_UNAVAILABLE -> settings.connectionIssueBssidAtEpochMs
                 ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE -> settings.connectionIssueHotspotConfigAtEpochMs
                 ConnectionIssue.HOTSPOT_NOT_RUNNING -> settings.connectionIssueHotspotOffAtEpochMs
+                ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED -> settings.connectionIssueWifiDirectRefusedAtEpochMs
+                ConnectionIssue.WIFI_DIRECT_STACK_CYCLED -> settings.connectionIssueWifiDirectCycledAtEpochMs
+                ConnectionIssue.WIFI_DIRECT_STACK_STUCK -> settings.connectionIssueWifiDirectStuckAtEpochMs
+                ConnectionIssue.WIFI_RADIO_OFF -> settings.connectionIssueWifiRadioOffAtEpochMs
+                ConnectionIssue.VIDEO_LINK_TOO_SLOW -> settings.connectionIssueVideoLinkTooSlowAtEpochMs
+                ConnectionIssue.FIVE_GHZ_CHANNEL_REFUSED -> settings.connectionIssueFiveGhzChannelRefusedAtEpochMs
+                ConnectionIssue.HEADUNIT_SERVER_NOT_ANSWERING -> settings.connectionIssueHeadUnitServerDeafAtEpochMs
+                ConnectionIssue.HANDS_FREE_HELD_ELSEWHERE -> settings.connectionIssueHandsFreeHeldAtEpochMs
+                ConnectionIssue.HANDS_FREE_RECORD_REFUSED -> settings.connectionIssueHandsFreeRecordRefusedAtEpochMs
+                ConnectionIssue.PHONE_HOLDS_STALE_ENDPOINT -> settings.connectionIssueStaleEndpointAtEpochMs
+                ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP -> settings.connectionIssueHomeWifiRejoinedAtEpochMs
+                ConnectionIssue.STALE_USB_ACCESSORY -> settings.connectionIssueStaleUsbAccessoryAtEpochMs
             }
         } catch (e: Exception) {
             0L
@@ -139,6 +275,18 @@ object ConnectionIssues {
                     ConnectionIssue.BSSID_UNAVAILABLE -> settings.connectionIssueBssidAtEpochMs = atEpochMs
                     ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE -> settings.connectionIssueHotspotConfigAtEpochMs = atEpochMs
                     ConnectionIssue.HOTSPOT_NOT_RUNNING -> settings.connectionIssueHotspotOffAtEpochMs = atEpochMs
+                    ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED -> settings.connectionIssueWifiDirectRefusedAtEpochMs = atEpochMs
+                    ConnectionIssue.WIFI_DIRECT_STACK_CYCLED -> settings.connectionIssueWifiDirectCycledAtEpochMs = atEpochMs
+                    ConnectionIssue.WIFI_DIRECT_STACK_STUCK -> settings.connectionIssueWifiDirectStuckAtEpochMs = atEpochMs
+                    ConnectionIssue.WIFI_RADIO_OFF -> settings.connectionIssueWifiRadioOffAtEpochMs = atEpochMs
+                    ConnectionIssue.VIDEO_LINK_TOO_SLOW -> settings.connectionIssueVideoLinkTooSlowAtEpochMs = atEpochMs
+                    ConnectionIssue.FIVE_GHZ_CHANNEL_REFUSED -> settings.connectionIssueFiveGhzChannelRefusedAtEpochMs = atEpochMs
+                    ConnectionIssue.HEADUNIT_SERVER_NOT_ANSWERING -> settings.connectionIssueHeadUnitServerDeafAtEpochMs = atEpochMs
+                    ConnectionIssue.HANDS_FREE_HELD_ELSEWHERE -> settings.connectionIssueHandsFreeHeldAtEpochMs = atEpochMs
+                    ConnectionIssue.HANDS_FREE_RECORD_REFUSED -> settings.connectionIssueHandsFreeRecordRefusedAtEpochMs = atEpochMs
+                    ConnectionIssue.PHONE_HOLDS_STALE_ENDPOINT -> settings.connectionIssueStaleEndpointAtEpochMs = atEpochMs
+                    ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP -> settings.connectionIssueHomeWifiRejoinedAtEpochMs = atEpochMs
+                    ConnectionIssue.STALE_USB_ACCESSORY -> settings.connectionIssueStaleUsbAccessoryAtEpochMs = atEpochMs
                 }
             } catch (e: Exception) {
                 AppLog.d("ConnectionIssues: could not record $issue: ${e.message}")

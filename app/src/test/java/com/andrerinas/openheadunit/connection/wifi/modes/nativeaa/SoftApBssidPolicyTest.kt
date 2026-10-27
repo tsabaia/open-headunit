@@ -145,4 +145,62 @@ class SoftApBssidPolicyTest {
         val resolved = SoftApBssidPolicy.choose("11:22:33:44:55:66", "11:22:33:44:55:66", null)
         assertFalse(SoftApBssidPolicy.disprovesBssidUnavailable(resolved, "11:22:33:44:55:66"))
     }
+
+    @Test
+    fun `the list form takes the first usable detected address in order`() {
+        assertEquals(
+            "AA:BB:CC:DD:EE:FF",
+            SoftApBssidPolicy.choose(null, listOf(null, "0", "aa-bb-cc-dd-ee-ff", "11:22:33:44:55:66"))
+        )
+    }
+
+    @Test
+    fun `the list form still lets the override outrank every detected address`() {
+        assertEquals(
+            "11:22:33:44:55:66",
+            SoftApBssidPolicy.choose("11:22:33:44:55:66", listOf("aa:bb:cc:dd:ee:ff"))
+        )
+    }
+
+    @Test
+    fun `the list form rejects placeholders and non-addresses`() {
+        assertEquals(
+            "",
+            SoftApBssidPolicy.choose("0", listOf("02:00:00:00:00:00", "00:00:00:00:00:00", "", null))
+        )
+    }
+
+    @Test
+    fun `the detected-first form lets the hardware outrank the hand-typed address`() {
+        val detected = listOf("D2:65:D0:00:51:73")
+        assertEquals(
+            "D2:65:D0:00:51:73",
+            SoftApBssidPolicy.chooseDetectedFirst(detected, "00:27:15:43:06:6A")
+        )
+        assertFalse(SoftApBssidPolicy.overrideAnswered(detected, "00:27:15:43:06:6A"))
+    }
+
+    @Test
+    fun `the detected-first form falls back to the override when no rung answers`() {
+        val detected = listOf(null, "02:00:00:00:00:00", "")
+        assertEquals(
+            "00:27:15:43:06:6A",
+            SoftApBssidPolicy.chooseDetectedFirst(detected, "00-27-15-43-06-6a")
+        )
+        assertTrue(SoftApBssidPolicy.overrideAnswered(detected, "00:27:15:43:06:6A"))
+    }
+
+    @Test
+    fun `an unset override is not an answer, detected-first or not`() {
+        assertEquals("", SoftApBssidPolicy.chooseDetectedFirst(listOf(null), "0"))
+        assertFalse(SoftApBssidPolicy.overrideAnswered(listOf(null), "0"))
+    }
+
+    @Test
+    fun `the two forms agree`() {
+        assertEquals(
+            SoftApBssidPolicy.choose("0", "aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"),
+            SoftApBssidPolicy.choose("0", listOf("aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"))
+        )
+    }
 }

@@ -3,11 +3,9 @@ package com.andrerinas.openheadunit.aap
 import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
-import com.andrerinas.openheadunit.aap.protocol.AudioConfigs
 import com.andrerinas.openheadunit.aap.protocol.Channel
 import com.andrerinas.openheadunit.aap.protocol.messages.DrivingStatusEvent
 import com.andrerinas.openheadunit.aap.protocol.messages.LocationUpdateEvent
-import com.andrerinas.openheadunit.aap.protocol.messages.MicrophoneResponse
 import com.andrerinas.openheadunit.aap.protocol.messages.ServiceDiscoveryResponse
 import com.andrerinas.openheadunit.aap.protocol.proto.Common
 import com.andrerinas.openheadunit.aap.protocol.proto.Control
@@ -17,9 +15,13 @@ import com.andrerinas.openheadunit.aap.protocol.proto.Sensors
 import com.andrerinas.openheadunit.decoder.audio.MicRecorder
 import com.andrerinas.openheadunit.decoder.audio.MicrophonePolicy
 import com.andrerinas.openheadunit.decoder.video.VideoDecoder
+import com.andrerinas.openheadunit.decoder.video.VideoDecoderBackendPolicy
 import com.andrerinas.openheadunit.location.LocationHolder
+import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.utils.AppLog
+import com.andrerinas.openheadunit.utils.HeadUnitScreenConfig
 import com.andrerinas.openheadunit.utils.Settings
+import com.andrerinas.openheadunit.utils.VideoFallbackPolicy
 import com.andrerinas.openheadunit.utils.Utils
 
 interface AapControl {
@@ -51,9 +53,24 @@ internal class AapControlMedia(
                 AppLog.i("RX: Video Focus Request - mode: %s, reason: %s", focusRequest.mode, focusRequest.reason)
 
                 if (focusRequest.mode == Media.VideoFocusMode.VIDEO_FOCUS_NATIVE) {
-                    AppLog.i("Video Focus NATIVE received. User likely clicked Exit. Stopping transport.")
-                    aapTransport.wasUserExit = true
-                    aapTransport.stop()
+                    AppLog.i("Video Focus NATIVE received. User clicked Exit in Android Auto.")
+                    val ctx = aapTransport.context
+                    val settings = App.provide(ctx).settings
+                    when (settings.aaExitAction) {
+                        Settings.ExitAction.OEM_LAUNCHER -> {
+                            AppLog.i("ExitAction: Minimizing projection to OEM Launcher")
+                            AapProjectionActivity.minimizeToHome(ctx)
+                        }
+                        Settings.ExitAction.APP_HOME -> {
+                            AppLog.i("ExitAction: Returning to App Home")
+                            AapProjectionActivity.returnToAppHome(ctx)
+                        }
+                        Settings.ExitAction.DISCONNECT -> {
+                            AppLog.i("ExitAction: Disconnecting projection session")
+                            aapTransport.wasUserExit = true
+                            aapTransport.stop()
+                        }
+                    }
                 }
                 return 0
             }
@@ -67,9 +84,9 @@ internal class AapControlMedia(
                 return 0
             }
             Media.MsgType.MEDIA_MESSAGE_ACK_VALUE -> {
-                // The phone flow-controls this stream and nothing here has ever counted its acks,
-                // so a window we ran past would have looked like silence. Counted, not acted on.
-                if (message.channel == Channel.ID_MIC) aapTransport.onMicAck()
+                if (message.channel == Channel.ID_MIC) {
+                    aapTransport.onMicAck(message.parse(Media.Ack.newBuilder()).build())
+                }
                 return 0
             }
             else -> AppLog.e("Unsupported Media message type: ${message.type}")
@@ -80,8 +97,15 @@ internal class AapControlMedia(
     private fun mediaStartRequest(request: Media.Start, channel: Int): Int {
         AppLog.i("Media Start Request %s: session=%d, config_index=%d", Channel.name(channel), request.sessionId, request.configurationIndex)
 
+        // The phone's pick must reach the geometry before the first frame is laid out.
+        if (channel == Channel.ID_VID &&
+            VideoFallbackPolicy.adopts(request.configurationIndex, HeadUnitScreenConfig.hasOfferedFallback())) {
+            HeadUnitScreenConfig.adoptFallback()
+        }
+
         aapTransport.setSessionId(channel, request.sessionId)
         aapTransport.noteAudioSinkStarted(channel)
+        aapAudio.preparePlayback(channel)
         return 0
     }
 
@@ -91,21 +115,23 @@ internal class AapControlMedia(
 
         val maxUnacked = maxUnackedFor(channel)
         val configResponse = Media.Config.newBuilder().apply {
-            status = Media.Config.ConfigStatus.HEADUNIT
+            status = Media.Config.ConfigStatus.STATUS_READY
             this.maxUnacked = maxUnacked
 
-            addConfigurationIndices(0)
+            val offered = channel == Channel.ID_VID && HeadUnitScreenConfig.hasOfferedFallback()
+            VideoFallbackPolicy.configurationIndices(offered).forEach { addConfigurationIndices(it) }
         }.build()
         AppLog.i("Config response: %s (maxUnacked=%d)", configResponse, maxUnacked)
         val msg = AapMessage(channel, Media.MsgType.MEDIA_MESSAGE_CONFIG_VALUE, configResponse)
-        aapTransport.send(msg)
-
         if (channel == Channel.ID_VID) {
-            aapTransport.gainVideoFocus()
+            if (aapTransport.sendVideoSetupResponse(msg)) aapTransport.gainVideoFocus()
+        } else {
+            aapTransport.send(msg)
         }
 
         // Pushing AudioFocusNotification
         if (Channel.isAudio(channel)) {
+            aapAudio.noteSinkCodec(channel, request.type)
             aapAudio.precreateAudioTrack(channel)
             val focusNotification = Control.AudioFocusNotification.newBuilder()
                 .setFocusState(Control.AudioFocusNotification.AudioFocusStateType.STATE_GAIN)
@@ -119,22 +145,23 @@ internal class AapControlMedia(
 
     private fun maxUnackedFor(channel: Int): Int {
         if (channel == Channel.ID_VID) {
-            val softwareHevc =
-                aapTransport.settings.videoCodec == VideoDecoder.CodecType.H265.settingsValue &&
-                        aapTransport.settings.forceSoftwareDecoding &&
-                        aapTransport.settings.softwareVideoDecoder == Settings.SoftwareVideoDecoder.BUNDLED_FFMPEG
-            if (softwareHevc) {
-                // Keep the phone closer to decoder pace. A large wireless window lets video
-                // backlog turn into visible input lag when 2K HEVC is decoded in software.
-                return if (aapTransport.isWireless) 6 else 8
-            }
-            // Left wide for hardware decode, deliberately. The window is counted in messages, not
-            // frames, and a keyframe fragments into a dozen or more of them, so narrowing it makes
-            // the phone stall mid-keyframe and caps throughput at window/RTT, worst on exactly the
-            // congested links where the backlog it would be trying to bound shows up. The backlog
-            // is bounded where it costs nothing instead: the decoder discards decoded frames it is
-            // behind on rather than having the phone send fewer.
-            return if (aapTransport.isWireless) 12 else 16
+            // ServiceDiscovery's announcement, not the stored preference, chooses the decoder.
+            val codec = aapTransport.aapVideo.announcedCodec
+                ?: if (aapTransport.settings.videoCodec == VideoDecoder.CodecType.H265.settingsValue) {
+                    VideoDecoder.CodecType.H265
+                } else {
+                    VideoDecoder.CodecType.H264
+                }
+            val bundled = VideoDecoderBackendPolicy.useBundled(
+                codec,
+                aapTransport.settings.forceSoftwareDecoding,
+                aapTransport.settings.softwareVideoDecoder,
+            )
+            // Software decoding needs a tighter window to prevent input lag. Preserve platform
+            // throughput when bundled decoding is not selected or unavailable for this codec.
+            // Credits count complete DATA messages, not individual keyframe fragments; the
+            // transport queue separately bounds peers that exceed the advertised window.
+            return VideoDecoderBackendPolicy.videoAckWindow(aapTransport.isWireless, bundled)
         }
 
         // Audio still benefits from a wider jitter window, especially on wireless.
@@ -152,8 +179,7 @@ internal class AapControlMedia(
             // predicate would make this head unit claim audio focus and precreate an AudioTrack for
             // a microphone. A stop here is still the phone saying it wants no more PCM, and until
             // now the recorder kept running and kept sending.
-            micRecorder.stop()
-            aapTransport.onMicSessionEnded()
+            aapTransport.closeMicSession()
         } else if (channel == Channel.ID_VID) {
             if (aapTransport.ignoreNextStopRequest) {
                 AppLog.i("Video Sink Stopped -> Ignored (Forced Keyframe Request)")
@@ -166,51 +192,29 @@ internal class AapControlMedia(
     }
 
     /**
-     * Open or close the microphone, and say so.
-     *
-     * At INFO because the request's own toString is the only place anyone will ever see what
-     * Android Auto asks for - anc_enabled, ec_enabled and the flow-control window - none of which
-     * this head unit has ever recorded, let alone honoured.
+     * Open or close an ACK-controlled microphone session and reply through its lifecycle owner.
+     * Keep the request at INFO: it records the phone's ANC/EC preferences and maxUnacked window,
+     * so a silent assistant can be traced from the request through capture and uplink summaries.
+     * The window controls sending; ANC/EC settings describe the request, not proof that a device
+     * enabled those effects. Native startup is asynchronous and must not block media reception.
      */
     private fun micRequest(micRequest: Media.MicrophoneRequest): Int {
         AppLog.i("Mic request: %s", micRequest)
 
-        val status = if (micRequest.open) {
-            when (MicrophonePolicy.declineReason(
-                    aapTransport.settings.useHeadUnitMicrophone, micRecorder.isAvailable)) {
-                MicrophonePolicy.Decline.USER_SETTING -> {
-                    // Named in the user's terms, the same way the audio-sink skip is, so a silent
-                    // assistant reads as a setting rather than as a fault.
-                    AppLog.i("Mic request: the head unit microphone is off in Settings. Declining " +
-                        "and sending nothing, so a Bluetooth headset keeps this microphone. The " +
-                        "service is not announced either, so a request arriving here means the " +
-                        "phone kept an older record of this head unit")
-                    Common.MessageStatus.STATUS_INTERNAL_ERROR_VALUE
-                }
-                MicrophonePolicy.Decline.NO_MICROPHONE -> {
-                    AppLog.w("Mic request: this device has no usable microphone capture; declining")
-                    Common.MessageStatus.STATUS_INTERNAL_ERROR_VALUE
-                }
-                MicrophonePolicy.Decline.NONE -> {
-                    val result = micRecorder.start()
-                    if (result != 0) {
-                        AppLog.w("Mic request: capture did not start (code $result); telling the " +
-                            "phone so rather than leaving it waiting on a stream that will never arrive")
-                        Common.MessageStatus.STATUS_INTERNAL_ERROR_VALUE
-                    } else {
-                        Common.MessageStatus.STATUS_SUCCESS_VALUE
-                    }
-                }
-            }
+        if (!micRequest.open) {
+            aapTransport.closeMicSession(reply = true)
+        } else if (MicrophonePolicy.declineReason(aapTransport.settings.useHeadUnitMicrophone,
+                micRecorder.isAvailable) != MicrophonePolicy.Decline.NONE) {
+            // A disabled head-unit microphone leaves capture with the phone or Bluetooth
+            // headset. The service is not advertised in that mode; a request can still arrive
+            // if the phone retained discovery data from an earlier connection.
+            val reason = MicrophonePolicy.declineReason(aapTransport.settings.useHeadUnitMicrophone,
+                micRecorder.isAvailable)
+            AppLog.w("Mic request declined: $reason (head-unit microphone setting and availability)")
+            aapTransport.rejectMicSession()
         } else {
-            micRecorder.stop()
-            // The session boundary the uplink report is measured over. Without it the line only
-            // appears at disconnect, long after the assistant session it describes.
-            aapTransport.onMicSessionEnded()
-            Common.MessageStatus.STATUS_SUCCESS_VALUE
+            aapTransport.openMicSession(if (micRequest.hasMaxUnacked()) micRequest.maxUnacked else 2)
         }
-
-        aapTransport.send(MicrophoneResponse(status, aapTransport.getSessionId(Channel.ID_MIC)))
         return 0
     }
 
@@ -349,14 +353,15 @@ internal class AapControlService(
     private fun serviceDiscoveryRequest(request: Control.ServiceDiscoveryRequest): Int {
         AppLog.i("Service Discovery Request: %s", request.phoneName)
 
-        val msg = ServiceDiscoveryResponse(context)
+        val msg = ServiceDiscoveryResponse(context, aapAudio.sessionConfig, aapTransport)
         aapTransport.send(msg)
         return 0
     }
 
     private fun pingRequest(request: Control.PingRequest, channel: Int): Int {
         val response = Control.PingResponse.newBuilder()
-                .setTimestamp(System.nanoTime())
+                // Echo the phone's correlation token; the two monotonic clocks have different origins.
+                .setTimestamp(request.timestamp)
                 .build()
 
         val msg = AapMessage(channel, Control.ControlMsgType.MESSAGE_PING_RESPONSE_VALUE, response)
@@ -368,7 +373,7 @@ internal class AapControlService(
         AppLog.i("Navigation Focus Request: %s", request.focusType)
 
         val response = Control.NavFocusNotification.newBuilder()
-                .setFocusType(Control.NavFocusType.NAV_FOCUS_2)
+                .setFocusType(Control.NavFocusType.NAV_FOCUS_PROJECTED)
                 .build()
 
         val msg = AapMessage(channel, Control.ControlMsgType.MESSAGE_NAV_FOCUS_NOTIFICATION_VALUE, response)
@@ -379,6 +384,7 @@ internal class AapControlService(
     }
 
     private fun byebyeRequest(request: Control.ByeByeRequest, channel: Int): Int {
+        aapTransport.notePeerClose()
         AppLog.i("!!! RECEIVED BYEBYE REQUEST FROM PHONE !!! Reason: ${request.reason}")
 
         val msg = AapMessage(channel, Control.ControlMsgType.MESSAGE_BYEBYE_RESPONSE_VALUE, Control.ByeByeResponse.newBuilder().build())
@@ -423,16 +429,16 @@ internal class AapControlService(
         // Best-effort: request system audio focus to duck other apps on the headunit.
         // The result is intentionally ignored for the protocol response above, which has already
         // been sent — only the system-level grab is in question here, never the always-grant reply.
-        if (settings.enableAudioSink) {
-            if (settings.staticAudioFocus) {
+        if (aapAudio.sessionConfig.enabled) {
+            if (aapAudio.sessionConfig.staticFocus) {
                 AppLog.i("Static Audio Focus active - skipping dynamic system focus request to prevent routing loss")
             } else {
-                // Gated at the call site, not inside requestFocusChange: that function is also the
+                // Gated at the call site, not inside postProtocolFocusChange: that function is also the
                 // static path's permanent grab from CommManager, where the answer is the opposite.
                 val isRelease = notification.request.number ==
                         Control.AudioFocusRequestNotification.AudioFocusRequestType.RELEASE_VALUE
                 if (aapAudio.shouldHonourProtocolFocusRequest(isRelease)) {
-                    aapAudio.requestFocusChange(AudioConfigs.stream(channel, settings), notification.request.number, AudioManager.OnAudioFocusChangeListener {
+                    aapAudio.postProtocolFocusChange(aapAudio.streamFor(channel), notification.request.number, AudioManager.OnAudioFocusChangeListener {
                         AppLog.i("System audio focus changed: $it ${systemFocusName[it]}")
                     })
                 }
@@ -489,6 +495,12 @@ internal class AapControlGateway(
             return channelOpenRequest(request, message.channel)
         }
 
+        // Type numbers are scoped by service. CONTROL explicitly selects generic control
+        // handling even on an audio/video channel; channel number alone cannot choose the
+        // protobuf schema. ChannelOpen above is handled before the service is established.
+        if (message.flags.toInt() and AapMessageFraming.FLAG_BIT_CONTROL != 0) {
+            return serviceControl.execute(message)
+        }
         when (message.channel) {
             Channel.ID_CTR -> return serviceControl.execute(message)
             Channel.ID_INP -> return touchControl.execute(message)

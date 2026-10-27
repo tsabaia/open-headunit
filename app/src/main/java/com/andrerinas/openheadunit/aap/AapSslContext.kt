@@ -13,13 +13,21 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLEngine
 import javax.net.ssl.SSLEngineResult
 
-class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
-    private val sslContext: SSLContext = createSslContext(keyManager)
+class AapSslContext internal constructor(private val sslContext: SSLContext): AapSsl {
+    constructor(keyManager: SingleKeyKeyManager) : this(createSslContext(keyManager))
+
+    /** Share resumption caches, not mutable engines, buffers or control queues between links. */
+    internal fun newSession(): AapSslContext = AapSslContext(sslContext)
     private lateinit var sslEngine: SSLEngine
     private lateinit var txBuffer: ByteBuffer
     private lateinit var rxBuffer: ByteBuffer
+    private lateinit var applicationPump: TlsApplicationPump
+    private val controlRecords = java.util.ArrayDeque<ByteArray>()
+    private var controlRecordBytes = 0
+    @Volatile private var controlRecordListener: (() -> Unit)? = null
 
     @Volatile var isUserDisconnect = false
+    @Volatile internal var onPeerClose: (() -> Unit)? = null
 
     override fun performHandshake(connection: ProjectionConnection): Boolean {
         if (prepare() < 0) return false
@@ -27,8 +35,14 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
         // Buffer for unencrypted TLS records extracted from AAP messages.
         // We use a local queue or buffer to keep track of bytes ready for the SSLEngine.
         var pendingTlsData = ByteArray(0)
+        val frames = HandshakeFrameReader(SystemClock::elapsedRealtime,
+            if (connection.type == ProjectionConnection.Type.USB) 100 else 1) { bytes, length, timeout ->
+            connection.recvBlocking(bytes, length, timeout, false)
+        }
 
-        // Hard cap on the entire SSL phase.
+        // Give a slow dongle the whole 15 s TLS phase, including an initially silent peer.
+        // A quiet first 2 s is not a separate failure; partial frames and TLS records share
+        // this deadline without renewing it. A transport error still stops the read early.
         val deadline = android.os.SystemClock.elapsedRealtime() + SSL_HANDSHAKE_TIMEOUT_MS
 
         while (getHandshakeStatus() != SSLEngineResult.HandshakeStatus.FINISHED &&
@@ -43,7 +57,7 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
                 SSLEngineResult.HandshakeStatus.NEED_UNWRAP -> {
                     // If we don't have enough data for a meaningful unwrap, read a full AAP message
                     if (pendingTlsData.isEmpty()) {
-                        val messageData = readAapMessage(connection) ?: return false
+                        val messageData = readAapMessage(frames, deadline) ?: return false
                         pendingTlsData = messageData
                     }
 
@@ -62,7 +76,7 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
                         SSLEngineResult.Status.BUFFER_UNDERFLOW -> {
                             // The current pendingTlsData doesn't contain a full TLS record.
                             // Read another AAP message and append it.
-                            val nextMessage = readAapMessage(connection) ?: return false
+                            val nextMessage = readAapMessage(frames, deadline) ?: return false
                             pendingTlsData += nextMessage
                             AppLog.d("SSL Handshake: buffered ${pendingTlsData.size} B after underflow")
                         }
@@ -76,7 +90,7 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
                 SSLEngineResult.HandshakeStatus.NEED_WRAP -> {
                     val handshakeData = handshakeRead()
                     val bio = Messages.createRawMessage(0, 3, 3, handshakeData)
-                    if (connection.sendBlocking(bio, bio.size, 2000) < 0) {
+                    if (connection.sendBlocking(bio, bio.size, 2000) != bio.size) {
                         AppLog.e("SSL Handshake: Send failed")
                         return false
                     }
@@ -102,37 +116,28 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
         return true
     }
 
-    /**
-     * Reads a single complete AAP message from the connection.
-     * This ensures that we always respect AAP framing boundaries.
-     */
-    private fun readAapMessage(connection: ProjectionConnection): ByteArray? {
-        val header = ByteArray(6)
-        // Read exactly 6 bytes for the AAP header
-        if (connection.recvBlocking(header, 6, 2000, true) != 6) {
-            AppLog.e("SSL Handshake: Failed to read AAP header")
-            return null
+    /** Consume complete cleartext envelopes before handing their payload to SSLEngine. */
+    private fun readAapMessage(frames: HandshakeFrameReader, deadline: Long): ByteArray? {
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val frame = frames.readFrame(deadline) ?: return null
+            if (HandshakeMessagePolicy.isLateVersionResponse(frame)) {
+                // Retried requests can produce extra responses. Skip well-formed responses
+                // unless they report -1(STATUS_NO_COMPATIBLE_VERSION), just as before TLS.
+                if (AapVersionNegotiation.parse(frame, frame.size)?.accepted != true) {
+                    AppLog.e("SSL Handshake: invalid late VERSION_RESPONSE")
+                    return null
+                }
+                AppLog.i("SSL Handshake: discarded a late VERSION_RESPONSE")
+                continue
+            }
+            if (frame[0] != 0.toByte() || frame[4] != 0.toByte() || frame[5] != 3.toByte()) {
+                AppLog.e("SSL Handshake: expected channel 0 SSL_HANDSHAKE message")
+                return null
+            }
+            return frame.copyOfRange(6, frame.size)
         }
-
-        // AAP Header: [0]=Channel, [1]=Flags, [2..3]=Length (Big Endian), [4..5]=Type
-        // The length in the header includes the 4 bytes of channel/flags/length itself?
-        // No, in Messages.kt: size + 2 is stored in bytes 2..3.
-        // So payload length = (header[2]*256 + header[3]) - 2.
-        val totalLength = ((header[2].toInt() and 0xFF) shl 8) or (header[3].toInt() and 0xFF)
-        val payloadLength = totalLength - 2 // Minus the 2 bytes for the type field (bytes 4-5)
-
-        if (payloadLength < 0 || payloadLength > Messages.DEF_BUFFER_LENGTH) {
-            AppLog.e("SSL Handshake: Invalid AAP payload length: $payloadLength")
-            return null
-        }
-
-        val payload = ByteArray(payloadLength)
-        if (connection.recvBlocking(payload, payloadLength, 2000, true) != payloadLength) {
-            AppLog.e("SSL Handshake: Failed to read AAP payload ($payloadLength bytes)")
-            return null
-        }
-
-        return payload
+        AppLog.e("SSL Handshake: receive deadline expired")
+        return null
     }
 
     private fun prepare(): Int {
@@ -153,11 +158,14 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
                 plaintextBuffer = ByteArray(rxBuffer.capacity())
             }
         }
+        controlRecords.clear()
+        controlRecordBytes = 0
         sslEngine.beginHandshake()
         return 0
     }
 
     override fun postHandshakeReset() {
+        applicationPump = TlsApplicationPump(sslEngine)
         // Clear buffers. In this implementation, the buffers are re-created for each wrap/unwrap
         // operation (implicitly by ByteBuffer.wrap), but clearing them ensures no stale data.
         txBuffer.clear()
@@ -165,7 +173,12 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
     }
 
     override fun release() {
-        // No-op for SSLEngine (garbage collection handles it)
+        synchronized(this) {
+            controlRecordListener = null
+            onPeerClose = null
+            controlRecords.clear()
+            controlRecordBytes = 0
+        }
     }
 
     private fun getHandshakeStatus(): SSLEngineResult.HandshakeStatus {
@@ -240,15 +253,8 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
     /** Reused wrapper, so the per-message allocation is zero rather than one small object. */
     private val plaintextHolder = ByteArrayWithLimit(ByteArray(0), 0)
 
-    /**
-     * Print budget for the zero-produce unwrap line, in the shape [AuditReportPolicy] governs.
-     *
-     * A single empty unwrap is legal TLS (a record can carry only handshake or alert bytes), so a
-     * handful at session start are ordinary and an unthrottled WARN would be a storm. A *run* of
-     * them mid-session is the first symptom of a desynced stream, and it used to print only at
-     * DEBUG, below the level reporter captures keep - so the log told that story from the
-     * disconnect instead of from the cause.
-     */
+    // TLS control records may legitimately produce no application bytes. Keep a bounded
+    // warning stream so reporter logs show these intervals without flooding normal traffic.
     private var zeroUnwrapReports = 0
     private var zeroUnwrapLastLogMs = 0L
     private var zeroUnwrapSuppressed = 0
@@ -268,30 +274,28 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
             try {
                 rxBuffer.clear()
                 val encrypted = ByteBuffer.wrap(buffer, start, length)
-                val result = sslEngine.unwrap(encrypted, rxBuffer)
-                runDelegatedTasks(result, sslEngine)
-
-                if (AppLog.LOG_VERBOSE) {
-                    statusLine = "SSL Decrypt Status: ${result.status}, Produced: ${result.bytesProduced()}, Consumed: ${result.bytesConsumed()}"
+                applicationPump.unwrap(encrypted, rxBuffer) { record ->
+                    if (controlRecordBytes + record.size > TlsApplicationPump.MAX_ENCRYPTED_BODY) {
+                        throw javax.net.ssl.SSLException("TLS control output queue exceeded its limit")
+                    }
+                    controlRecords.addLast(record)
+                    controlRecordBytes += record.size
                 }
-                if (result.bytesProduced() == 0) {
+                val produced = rxBuffer.position()
+                if (AppLog.LOG_VERBOSE) {
+                    statusLine = "SSL Decrypt: produced $produced, consumed ${length - encrypted.remaining()} bytes"
+                }
+                if (produced == 0 && length > 0) {
                     val now = SystemClock.elapsedRealtime()
                     if (AuditReportPolicy.shouldReport(zeroUnwrapReports, zeroUnwrapLastLogMs, now)) {
-                        val suppressed = zeroUnwrapSuppressed
+                        val suffix = if (zeroUnwrapSuppressed > 0)
+                            " (and $zeroUnwrapSuppressed more since the last report)" else ""
+                        zeroProduceLine = "SSL Decrypt: no application data after consuming $length bytes$suffix"
                         zeroUnwrapSuppressed = 0
                         zeroUnwrapReports++
                         zeroUnwrapLastLogMs = now
-                        val suffix =
-                            if (suppressed > 0) " (and $suppressed more since the last report)" else ""
-                        zeroProduceLine = "SSL Decrypt: unwrap produced no application data " +
-                            "(status ${result.status}, consumed ${result.bytesConsumed()} of " +
-                            "$length bytes)$suffix"
-                    } else {
-                        zeroUnwrapSuppressed++
-                    }
+                    } else zeroUnwrapSuppressed++
                 }
-
-                val produced = result.bytesProduced()
                 if (produced > plaintextBuffer.size) {
                     // Cannot happen: rxBuffer is what unwrap writes into and plaintextBuffer is its
                     // capacity. Checked anyway, because silently truncating a message here would look
@@ -315,19 +319,25 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
                         }
                     }
                     if (allFF) {
-                        AppLog.i("SSL Decrypt: Magic Garbage detected. Marking as clean user disconnect.")
                         isUserDisconnect = true
+                        // Report at recognition, before diagnostics can yield to a failing writer.
+                        onPeerClose?.invoke()
+                        AppLog.i("SSL Decrypt: Magic Garbage detected. Marking as clean user disconnect.")
                     }
                 }
 
                 if (!isUserDisconnect) {
                     AppLog.e("SSL Decrypt failed", e)
+                    throw javax.net.ssl.SSLException("TLS application input failed", e)
                 }
                 null
             }
         }
         statusLine?.let { AppLog.d(it) }
         zeroProduceLine?.let { AppLog.w(it) }
+        if (decrypted != null && synchronized(this) { controlRecords.isNotEmpty() }) {
+            controlRecordListener?.invoke()
+        }
         return decrypted
     }
 
@@ -338,18 +348,25 @@ class AapSslContext(keyManager: SingleKeyKeyManager): AapSsl {
                 return null
             }
             try {
-                txBuffer.clear()
-                val byteBuffer = ByteBuffer.wrap(buffer, offset, length)
-                val result = sslEngine.wrap(byteBuffer, txBuffer)
-                runDelegatedTasks(result, sslEngine)
-                val resultBuffer = ByteArray(result.bytesProduced() + offset)
-                txBuffer.flip()
-                txBuffer.get(resultBuffer, offset, result.bytesProduced())
+                val encrypted = applicationPump.wrap(ByteBuffer.wrap(buffer, offset, length))
+                val resultBuffer = ByteArray(offset + encrypted.size)
+                encrypted.copyInto(resultBuffer, offset)
                 return ByteArrayWithLimit(resultBuffer, resultBuffer.size)
             } catch (e: Exception) {
                 AppLog.e("SSL Encrypt failed", e)
                 return null
             }
+        }
+    }
+
+    override fun setControlRecordListener(listener: (() -> Unit)?) {
+        controlRecordListener = listener
+    }
+
+    override fun drainControlRecords(): List<ByteArray> = synchronized(this) {
+        controlRecords.toList().also {
+            controlRecords.clear()
+            controlRecordBytes = 0
         }
     }
 

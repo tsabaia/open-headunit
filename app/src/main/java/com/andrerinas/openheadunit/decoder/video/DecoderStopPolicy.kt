@@ -4,11 +4,9 @@ package com.andrerinas.openheadunit.decoder.video
  * Decides whether a [VideoDecoder.stop] call ends the projection session or only tears the decoder
  * down while the phone keeps streaming.
  *
- * The distinction matters because some of the decoder's state describes the *stream* rather than
- * the decoder instance - the pinned codec type above all - and throwing it away while the stream is
- * still running forces a re-detection on whatever mid-stream packet happens to arrive next. That
- * heuristic cannot tell an ordinary H.264 P-slice header (0x41) from an HEVC VPS, so the re-detect
- * can hand an H.264 stream an HEVC decoder.
+ * Some state describes the stream rather than the decoder instance. Surface teardown cannot
+ * renegotiate the codec, so the pinned codec and parameter sets must survive it. Only a new
+ * session can replace the announcement used when the stream has no readable parameter sets.
  *
  * Anything not listed here ends the session, so an unrecognised reason keeps the old behaviour of
  * resetting everything.
@@ -27,6 +25,12 @@ object DecoderStopPolicy {
     /** A new surface replaced the old one; the AAP session is untouched. */
     const val REASON_NEW_SURFACE = "New surface"
 
+    /** The head unit went into sleep/standby (e.g. screen off, car turned off temporarily); the AAP session is untouched. */
+    const val REASON_SCREEN_OFF_SLEEP = "screen_off_sleep"
+
+    /** The projection activity was stopped (backgrounded); the AAP session is untouched. */
+    const val REASON_ACTIVITY_STOPPED = "activity_stopped"
+
     /** Prefix used by the decoder's own recovery restarts, which have never ended the session. */
     private const val RESTART_PREFIX = "restart"
 
@@ -35,6 +39,8 @@ object DecoderStopPolicy {
         REASON_DETACHED_FROM_WINDOW,
         REASON_PROJECTION_VIEW_RECREATE,
         REASON_NEW_SURFACE,
+        REASON_SCREEN_OFF_SLEEP,
+        REASON_ACTIVITY_STOPPED,
     )
 
     /** True when the decoder is tearing itself down to come straight back up. */

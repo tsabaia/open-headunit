@@ -141,19 +141,52 @@ class ConnectionIssueBannerPolicyTest {
 
     // Which conditions the selected route can be blocked by.
 
+    /**
+     * A cable-only unit never brings the stack up, so no wireless verdict can explain anything.
+     * The head unit server is the exception: Self Mode dials it with wireless unchosen.
+     */
     @Test
-    fun `no condition is relevant outside Native AA`() {
+    fun `only the head unit server condition survives wireless not being chosen`() {
+        for (transport in NativeTransport.values()) {
+            assertEquals(
+                transport.name,
+                setOf(ConnectionIssue.HEADUNIT_SERVER_NOT_ANSWERING, ConnectionIssue.STALE_USB_ACCESSORY),
+                ConnectionIssueBannerPolicy.relevantNow(3, transport, wirelessSelected = false)
+            )
+        }
+    }
+
+    @Test
+    fun `outside Native AA only the head unit server condition is relevant`() {
+        // Every other condition is raised on a Native AA branch. This one is keyed on the endpoint
+        // dialled rather than the mode, and every mode can dial Android Auto's own server.
+        for (mode in listOf(0, 1, 2)) {
+            for (transport in NativeTransport.values()) {
+                assertEquals(
+                    "mode=$mode transport=$transport",
+                    setOf(ConnectionIssue.HEADUNIT_SERVER_NOT_ANSWERING, ConnectionIssue.STALE_USB_ACCESSORY),
+                    ConnectionIssueBannerPolicy.relevantNow(
+                        mode = mode, transport = transport, wirelessSelected = true
+                    )
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `the head unit server condition stays relevant inside Native AA too`() {
         for (transport in NativeTransport.values()) {
             assertTrue(
                 transport.name,
-                ConnectionIssueBannerPolicy.relevantNow(mode = 2, transport = transport).isEmpty()
+                ConnectionIssue.HEADUNIT_SERVER_NOT_ANSWERING in
+                    ConnectionIssueBannerPolicy.relevantNow(3, transport, wirelessSelected = true)
             )
         }
     }
 
     @Test
     fun `WiFi Direct can be blocked by a masked BSSID but not by the hotspot configuration`() {
-        val relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT)
+        val relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, true)
         assertTrue(ConnectionIssue.BSSID_UNAVAILABLE in relevant)
         assertTrue(ConnectionIssue.BLUETOOTH_SENT_NO_DATA in relevant)
         assertFalse(ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE in relevant)
@@ -163,7 +196,7 @@ class ConnectionIssueBannerPolicyTest {
     fun `the hotspot transport is the other way round`() {
         // It survives an unusable BSSID by sending an empty one, so it never raises that
         // condition; it is the only route that resolves credentials from our own access point.
-        val relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.HOTSPOT)
+        val relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.HOTSPOT, true)
         assertTrue(ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE in relevant)
         assertTrue(ConnectionIssue.BLUETOOTH_SENT_NO_DATA in relevant)
         assertFalse(ConnectionIssue.BSSID_UNAVAILABLE in relevant)
@@ -174,11 +207,80 @@ class ConnectionIssueBannerPolicyTest {
         // WiFi Direct hosts its own group, so "no access point" cannot be why it failed.
         assertTrue(
             ConnectionIssue.HOTSPOT_NOT_RUNNING in
-                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.HOTSPOT)
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.HOTSPOT, true)
         )
         assertFalse(
             ConnectionIssue.HOTSPOT_NOT_RUNNING in
-                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT)
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, true)
+        )
+    }
+
+    @Test
+    fun `only the WiFi Direct route can be blocked by a refused group`() {
+        // The hotspot transport never asks for a group, so a refused one cannot be why it failed.
+        assertTrue(
+            ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED in
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, true)
+        )
+        assertFalse(
+            ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED in
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.HOTSPOT, true)
+        )
+    }
+
+    @Test
+    fun `only the WiFi Direct route can be blocked by a cycled stack`() {
+        // Raised in the same manager's state receiver, and the hotspot transport never registers it.
+        assertTrue(
+            ConnectionIssue.WIFI_DIRECT_STACK_CYCLED in
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, true)
+        )
+        assertFalse(
+            ConnectionIssue.WIFI_DIRECT_STACK_CYCLED in
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.HOTSPOT, true)
+        )
+    }
+
+    @Test
+    fun `a link too slow for the video blocks both transports`() {
+        // The only condition that is not about one route's way of getting a network. Both build one
+        // and hand it to the phone, and either can be too slow to carry the picture over it.
+        for (transport in NativeTransport.values()) {
+            assertTrue(
+                transport.name,
+                ConnectionIssue.VIDEO_LINK_TOO_SLOW in
+                    ConnectionIssueBannerPolicy.relevantNow(3, transport, true)
+            )
+        }
+    }
+
+    @Test
+    fun `no setting is a remedy for a link too slow for the video`() {
+        // Lowering the frame rate is a guess at the ceiling. Only a session that renders a frame
+        // proves it was enough, and that is what retires the record.
+        assertFalse(
+            ConnectionIssue.VIDEO_LINK_TOO_SLOW in
+                ConnectionIssueBannerPolicy.remedyApplied("ohu", "password", "EC:AB:3E:61:C5:7C")
+        )
+    }
+
+    @Test
+    fun `no setting is a remedy for a cycled stack`() {
+        // The remedy is another app on the unit, which nothing in these settings reaches.
+        assertFalse(
+            ConnectionIssue.WIFI_DIRECT_STACK_CYCLED in
+                ConnectionIssueBannerPolicy.remedyApplied("OHU-TEST", "testtest1234", "AA:BB:CC:DD:EE:FF")
+        )
+    }
+
+    @Test
+    fun `no setting is a remedy for a refused group`() {
+        // A group forming disproves it outright, so the record retires itself. Nothing the user can
+        // type reaches the radio's refusal, so hiding the banner on a typed value would hide a
+        // condition that is still exactly as true as it was.
+        assertFalse(
+            ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED in
+                ConnectionIssueBannerPolicy.remedyApplied("OHU-TEST", "testtest1234", "AA:BB:CC:DD:EE:FF")
         )
     }
 
@@ -193,11 +295,98 @@ class ConnectionIssueBannerPolicyTest {
     }
 
     @Test
+    fun `a radio that is off blocks WiFi Direct only`() {
+        // The hotspot route never asks for a group, so a radio that cannot host one is not the
+        // reason a hotspot connection failed.
+        assertTrue(
+            ConnectionIssue.WIFI_RADIO_OFF in
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, true)
+        )
+        assertFalse(
+            ConnectionIssue.WIFI_RADIO_OFF in
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.HOTSPOT, true)
+        )
+    }
+
+    @Test
+    fun `a refused hands-free record is claimed by both Native transports and by no remedy`() {
+        // It is raised where the listeners open, which both transports do, and nothing the user
+        // can type changes this unit's own Bluetooth stack's answer.
+        for (transport in NativeTransport.values()) {
+            assertTrue(
+                transport.name,
+                ConnectionIssue.HANDS_FREE_RECORD_REFUSED in
+                    ConnectionIssueBannerPolicy.relevantNow(3, transport, true)
+            )
+        }
+        assertFalse(
+            ConnectionIssue.HANDS_FREE_RECORD_REFUSED in
+                ConnectionIssueBannerPolicy.remedyApplied("a name", "a password", "02:00:00:00:00:01", "02:00:00:00:00:02")
+        )
+    }
+
+    @Test
+    fun `a home WiFi rejoining beside the group is WiFi Direct only and has no remedy here`() {
+        // Only the WiFi Direct bring-up stands the station down, and the lever is Android's own.
+        assertTrue(
+            ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP in
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, true)
+        )
+        assertFalse(
+            ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP in
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.HOTSPOT, true)
+        )
+        assertFalse(
+            ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP in
+                ConnectionIssueBannerPolicy.relevantNow(2, NativeTransport.WIFI_DIRECT, true)
+        )
+        assertFalse(
+            ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP in
+                ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, false)
+        )
+        assertFalse(
+            ConnectionIssue.HOME_WIFI_REJOINED_BESIDE_GROUP in
+                ConnectionIssueBannerPolicy.remedyApplied("a name", "a password", "02:00:00:00:00:01", "02:00:00:00:00:02")
+        )
+    }
+
+    @Test
+    fun `a stale USB accessory is relevant on a cable-only unit`() {
+        for (transport in NativeTransport.values()) {
+            assertTrue(
+                ConnectionIssue.STALE_USB_ACCESSORY in
+                    ConnectionIssueBannerPolicy.relevantNow(3, transport, wirelessSelected = false)
+            )
+        }
+    }
+
+    @Test
+    fun `a stale USB accessory is relevant in every wireless mode and transport`() {
+        for (mode in 0..3) {
+            for (transport in NativeTransport.values()) {
+                assertTrue(
+                    "mode=$mode transport=$transport",
+                    ConnectionIssue.STALE_USB_ACCESSORY in
+                        ConnectionIssueBannerPolicy.relevantNow(mode, transport, wirelessSelected = true)
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `no setting is a remedy for a stale USB accessory`() {
+        assertFalse(
+            ConnectionIssue.STALE_USB_ACCESSORY in
+                ConnectionIssueBannerPolicy.remedyApplied("a name", "a password", "02:00:00:00:00:01", "02:00:00:00:00:02")
+        )
+    }
+
+    @Test
     fun `every issue is relevant on some route`() {
         // The same guard as `every issue can be shown`: a condition no route claims would be
         // recorded on the connection path and then never shown to anybody.
         val everRelevant = NativeTransport.values()
-            .flatMap { ConnectionIssueBannerPolicy.relevantNow(3, it) }
+            .flatMap { ConnectionIssueBannerPolicy.relevantNow(3, it, true) }
             .toSet()
         for (issue in ConnectionIssue.values()) assertTrue(issue.name, issue in everRelevant)
     }
@@ -255,7 +444,7 @@ class ConnectionIssueBannerPolicyTest {
         assertNull(
             bannerFor(
                 standing = listOf(standing(ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE, 1_000L)),
-                relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT)
+                relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, true)
             )
         )
     }
@@ -281,7 +470,7 @@ class ConnectionIssueBannerPolicyTest {
                     standing(ConnectionIssue.BSSID_UNAVAILABLE, 1_000L),
                     standing(ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE, 9_000L)
                 ),
-                relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT)
+                relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, true)
             )
         )
     }
@@ -313,7 +502,7 @@ class ConnectionIssueBannerPolicyTest {
                     standing(ConnectionIssue.HOTSPOT_CONFIG_UNREADABLE, 9_000L)
                 ),
                 dismissedAtEpochMs = 2_000L,
-                relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT)
+                relevant = ConnectionIssueBannerPolicy.relevantNow(3, NativeTransport.WIFI_DIRECT, true)
             )
         )
     }
@@ -414,5 +603,40 @@ class ConnectionIssueBannerPolicyTest {
         }
         assertTrue("no state retired the record", retired > 0)
         assertTrue("no state kept a record", kept > 0)
+    }
+
+    @Test
+    fun `a wedged stack outranks the newer refusal it causes`() {
+        val shown = bannerFor(standing = listOf(
+            standing(ConnectionIssue.WIFI_DIRECT_STACK_STUCK, 1_000L),
+            standing(ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED, 5_000L)
+        ))
+        assertEquals(ConnectionIssue.WIFI_DIRECT_STACK_STUCK, shown)
+    }
+
+    @Test
+    fun `a wedged stack does not outrank newer records other than the refusal`() {
+        val shown = bannerFor(standing = listOf(
+            standing(ConnectionIssue.WIFI_DIRECT_STACK_STUCK, 1_000L),
+            standing(ConnectionIssue.WIFI_RADIO_OFF, 5_000L)
+        ))
+        assertEquals(ConnectionIssue.WIFI_RADIO_OFF, shown)
+        val cycled = bannerFor(standing = listOf(
+            standing(ConnectionIssue.WIFI_DIRECT_STACK_STUCK, 1_000L),
+            standing(ConnectionIssue.WIFI_DIRECT_STACK_CYCLED, 5_000L)
+        ))
+        assertEquals(ConnectionIssue.WIFI_DIRECT_STACK_CYCLED, cycled)
+    }
+
+    @Test
+    fun `a dismissed wedge hides neither a newer record nor the refusal`() {
+        val shown = bannerFor(
+            standing = listOf(
+                standing(ConnectionIssue.WIFI_DIRECT_STACK_STUCK, 1_000L),
+                standing(ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED, 5_000L)
+            ),
+            dismissedAtEpochMs = 2_000L
+        )
+        assertEquals(ConnectionIssue.WIFI_DIRECT_GROUP_REFUSED, shown)
     }
 }

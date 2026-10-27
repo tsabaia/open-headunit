@@ -3,11 +3,14 @@ package com.andrerinas.openheadunit.connection.usb
 import android.content.Context
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import android.os.SystemClock
 import android.widget.Toast
 import com.andrerinas.openheadunit.App
 import com.andrerinas.openheadunit.R
+import com.andrerinas.openheadunit.connection.ConnectionPriorityPolicy.Tier
 import com.andrerinas.openheadunit.connection.usb.UsbLauncherManager.Companion.ATTACH_FALLBACK_DELAY_MS
 import com.andrerinas.openheadunit.utils.AppLog
+import com.andrerinas.openheadunit.utils.Settings
 import com.andrerinas.openheadunit.utils.ToastUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -21,8 +24,8 @@ class UsbLauncherListener(private val manager: UsbLauncherManager) : UsbReceiver
     private val service = manager.service
 
     override fun onUsbAttach(device: UsbDevice) {
-        if (!UsbDeviceCompat.isAndroidDevice(device)) {
-            AppLog.i("Ignoring non-Android USB device attached in service (VID: ${device.vendorId}): ${device.deviceName}")
+        if (!UsbDeviceCompat.isConnectable(service, device)) {
+            AppLog.i("Ignoring USB device attached in service (${Settings.formatUsbVidPidDisplay(device.vendorId, device.productId)}): ${UsbDeviceCompat.connectableReason(service, device)}")
             return
         }
 
@@ -34,7 +37,7 @@ class UsbLauncherListener(private val manager: UsbLauncherManager) : UsbReceiver
             // Device already in AOA mode (re-enumerated after UsbAttachedActivity switched it).
             AppLog.i("USB accessory device attached, connecting.")
             service.launchMainActivityIfNeeded("USB accessory attach")
-            manager.checkAlreadyConnected(force = true)
+            manager.checkAlreadyConnected(force = true, settingsRestart = manager.pendingSettingsRestart())
         } else {
             // UsbAttachedActivity normally handles normal-mode devices via a manifest intent
             // filter. However, some headunits (especially Chinese MediaTek units) don't
@@ -47,15 +50,18 @@ class UsbLauncherListener(private val manager: UsbLauncherManager) : UsbReceiver
             service.launchMainActivityIfNeeded("USB normal attach ($deviceName)")
             service.serviceScope.launch {
                 delay(ATTACH_FALLBACK_DELAY_MS)
-                if (!commManager.isConnected && !manager.isSwitchingToProjection()) {
+                // The manager retains this scan if its own AOA switch is still running.
+                // An Activity-owned switch keeps its separate handoff guard.
+                if (!commManager.isConnected && !manager.isActivitySwitchInFlight()) {
                     AppLog.i("UsbAttachedActivity didn't handle $deviceName. Trying from service...")
-                    manager.checkAlreadyConnected(force = true)
+                    manager.checkAlreadyConnected(force = true, settingsRestart = manager.pendingSettingsRestart())
                 }
             }
         }
     }
 
     override fun onUsbDetach(device: UsbDevice) {
+        manager.noteRecoveryDeviceDetached(device)
         val commManager = App.provide(service).commManager
 
         service.userExitedAA = false
@@ -81,41 +87,50 @@ class UsbLauncherListener(private val manager: UsbLauncherManager) : UsbReceiver
         service.serviceScope.launch {
             delay(1500) // Give the phone/system time to settle its USB state
             AppLog.i("Accessory detach cooldown finished. Checking for re-connection...")
-            manager.checkAlreadyConnected(force = true)
+            manager.checkAlreadyConnected(force = true, settingsRestart = manager.pendingSettingsRestart())
         }
     }
 
+    override fun onUsbRecoveryPermission(token: String, granted: Boolean, device: UsbDevice) {
+        manager.onRecoveryPermission(token, granted, device)
+    }
+
     override fun onUsbPermission(granted: Boolean, connect: Boolean, device: UsbDevice) {
-        if (!UsbDeviceCompat.isAndroidDevice(device)) {
-            AppLog.i("Ignoring USB permission callback for non-Android device (VID: ${device.vendorId}): ${device.deviceName}")
+        if (!UsbDeviceCompat.isConnectable(service, device)) {
+            AppLog.i("Ignoring USB permission callback (VID: ${device.vendorId}): ${UsbDeviceCompat.matchReason(device)}")
             return
         }
+        val usbManager = UsbDeviceCompat.usbManager(service) ?: return
         val deviceName = UsbDeviceCompat(device).uniqueName
+        val restart = manager.takePermissionOwner(device)
+        // Permission is not a new user request for projection. An explicit stop still wins.
+        if (granted && manager.cancelledByUser) return
         if (granted) {
+            if (restart?.isSettingsRestartCancelled == true) return
+            if (restart != null &&
+                (!restart.acceptsSettingsRestart(App.provide(service).commManager.connectionState.value) ||
+                    SystemClock.elapsedRealtime() >= restart.settingsRestartUntilMs)) {
+                // A grant may outlive Save or arrive after another connection has come and
+                // gone. Use ordinary admission (including the Settings hold), without
+                // renewing Save. Explicit cancellation above still rejects this old grant.
+                manager.checkAlreadyConnected(force = true)
+                return
+            }
             AppLog.i("USB permission granted for $deviceName")
+            if (!manager.beginAttempt(Tier.USB, "USB $deviceName", restart)) return
             if (UsbDeviceCompat.isInAccessoryMode(device)) {
-                manager.setSwitchingToProjection(true)
-                service.serviceScope.launch {
-                    try {
-                        manager.connectWithRetry(device)
-                    } finally {
-                        manager.setSwitchingToProjection(false)
-                    }
+                manager.launchAttempt(restart) {
+                    manager.connectWithRetry(device, settingsRestart = restart)
                 }
             } else {
-                manager.setSwitchingToProjection(true)
-                val usbManager = service.getSystemService(Context.USB_SERVICE) as UsbManager
                 val settings = App.provide(service).settings
                 val usbMode = UsbAccessoryMode(usbManager)
-                service.serviceScope.launch(Dispatchers.IO) {
-                    try {
-                        if (usbMode.connectAndSwitch(device, settings.useLibusb)) {
-                            AppLog.i("Successfully requested switch to accessory mode for $deviceName")
-                        } else {
-                            AppLog.w("USB permission granted but connectAndSwitch failed for $deviceName")
-                        }
-                    } finally {
-                        manager.setSwitchingToProjection(false)
+                manager.launchAttempt(restart, Dispatchers.IO) {
+                    if (usbMode.connectAndSwitch(device, settings.useLibusb)) {
+                        manager.noteAccessorySwitchRequested()
+                        AppLog.i("Successfully requested switch to accessory mode for $deviceName")
+                    } else {
+                        AppLog.w("USB permission granted but connectAndSwitch failed for $deviceName")
                     }
                 }
             }

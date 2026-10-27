@@ -1,5 +1,80 @@
 # Changelog
-### v.3.3.0-beta4
+### 4.0.0-beta1
+- New Homescreen, thanks to @andrecuellar
+- AAP: send one version request over TCP, so a slow head unit server is not left deaf
+- AAP: Keep media and navigation display updates off the receive path
+- AAP: Preserve frame boundaries during handshake
+- AAP: send one version request over TCP, so a slow head unit server is not left deaf
+- WiFi Direct: detect a wedged P2P stack and offer a WiFi restart
+- WiFi: Pause automatic searches during wireless sessions with Shizuku
+- Native AA: remember a unit that refuses every banded WiFi Direct group
+- Native AA: connect faster
+- Wizard: test the decoder before recommending settings
+- Fix(usb): Resolve dongle AOA switching
+- Status pill: stop saying Android Auto is starting when nothing is
+- Projection: keep the decoder through a short cover
+- Display: size Automatic DPI to the panel, and keep the widescreen layout it already had
+- Video: Add H.264 support to bundled FFmpeg
+- Logs: name captures OHU_Log_ instead of HUR_Log_
+- Audio: Reduce renderer work and add independent music correction
+
+### v.3.5.0
+- Native AA: reconnect to a network that is still there, wake the phone over Bluetooth or the external module, bring a lost group or hotspot back after sleep, boot or ACC wake, stop advertising an address that moves, and pick, wake or hold back only for a phone that is on
+- Wireless: BSSID recovery via IPv6 EUI-64, keep the station stood down mid-session, hold every automatic bring-up while the unit is asleep, and log a refused start at boot instead of crashing
+- Added: Option to use Open Headunit as a launcher
+- Added: Simplified Chinese 🇨🇳, Indonesian 🇮🇩, Hindi 🇮🇳, Thai 🇹🇭, European Portuguese 🇵🇹
+- Connection: one attempt at a time, hold auto-connect behind settings and the pill's X, and fix the dongle's TLS handshake
+- Add on-demand "Check for Updates" button
+- Add FYT BLINK/DUDUAUTO module transport for Native AA thanks to @dohun0310
+- Added: Apps drawer, thanks to @amp3r1
+- Navigation: stop the road name from sticking after the road changes
+- Self Mode: release the dummy VPN once the session is up, and start none for Android Auto 17.4 and later
+- Video: no codec on a dying surface, a picture after a screen-off return in Texture mode, and a 720p fallback the phone can pick on a 2.4 GHz link
+- Automation: restore the three dropped automation commands, and stop Headunit Server connects preempting each other
+- Fix: crash when the USB service is missing, thanks to @muayyad-alsadi
+- Added: Performance overlay with its own settings screen, choose which lines it shows
+- Added: Root workaround for Android Auto 17.4+ wireless startup in the README, thanks to @mixalbl4-127
+- Wireless: request low-latency Wi-Fi during projection, and keep active WPP control connections with isolated listener generations, thanks to @emotionbug
+- Audio and mic: stabilize playback and AAC recovery with opt-in AAudio, honor the device's buffer minimum, smooth PCM transitions, isolate capture sessions and bound uplink flow control, thanks to @emotionbug
+- Protocol and TLS: unify AAP framing and message reassembly, keep payloads across application-phase control records, and send the final ByeBye first, thanks to @emotionbug
+- Connection: serialize session replacement, reconnect audio settings, cancel obsolete reconnect timers, and keep Nearby tunnels within their attempt, thanks to @emotionbug
+- Video: isolate decoder workers and retire activity-owned surfaces, thanks to @emotionbug
+- Floating button fixes and a connection status option, thanks to @Sesam17
+- USB: recover a stale phone without a replug, keep the phone's Media audio on if you choose, and stop reconnecting when no screen comes up
+- Settings: Exit in Android Auto ends the session again, Save writes only what changed, and the setup wizard sets the DPI again and asks for the vehicle type
+- Updates: open the release APK itself on units below Android 5.0
+- Audio: no more stutter or crackle with the Mgear Mstick4 dongle (firmware 1.9.4), thanks to @emotionbug
+- Self Mode: leave the media buttons and the media widget to the phone's own player, thanks to @Duzttt
+- Keymap: send letter keys to Android Auto, and give the night mode key its own entry, thanks to @Duzttt
+- Home: grey out the connection buttons you did not choose, thanks to @amp3r1
+- Night mode: new "Automatic (System)" option follows the system dark mode, thanks to @MohmmadQunibi
+- Settings: Enter saves a text dialog when the keyboard covers its buttons, thanks to @mohammed-just
+- DPI: fix the reduced Android Auto layout on small screens
+
+### v.3.4.0
+- USB: connect non-Pixel phones without fighting a fast-reverting dongle
+- Feat/automation command surface
+- Video-Fit and ultrawide touch enhancements with dynamic scaling and rework all the options, thanks to @o-jardenass and @Sesam17
+- Several enhancements for native mode, thanks to @o-jardenass
+- Added darkmode for splashscreen
+- Added ADB-Server to disable/close OEM apps like Zlink, Autokit etc. to reduce conflicts with OpenHU
+- Added Support for BYD Steering wheel keys, thanks to @nicoruy
+- Added floating Exit Button, thanks to @Sesan17
+- Added Log to clipboard, thanks to @peter9811
+- Native for External BT's + Connection Status pill + AAC improvements to @o-jardenass
+- Moved Ui-Scale to theming
+- Native AA: say when the unit's WiFi radio is off instead of retrying in silence
+- Fix: Endless Loop in Permission Requests.
+- Give Video its own transport thread
+- Stop old Android promising what it cannot do
+- Measure and size the audio sink
+
+### v.3.3.1
+- Added: Option to auto-resume media playback on quick reconnect if music was playing before disconnect
+- Fixed: Errors shown in playconsole
+- Big Improvements to native mode. Huge Thanks to @o-jcardenass for this!
+
+### v.3.3.0
 - Begin for theming of the App.
 - Refactor WiFi-Code from AapService into their own classes for better maintenance, thanks to @MrEAlderson
 - Refactor Self-Mode and USB-Mode from AapService into their own classes for better maintenance, thanks to @MrEAlderson
@@ -15,9 +90,10 @@
 - Several Native Mode fixes and enhancements
 - Mic: fix the uplink, and let the phone keep the microphone
 - Fix: Close keyboard that stays open on older Android versions to prevent layout issues
-- Per-channel audio stream selectio thanks to @nicoruy
+- Per-channel audio stream selection, thanks to @nicoruy
 - Added Android Auto 17.4 Notice for users, who don't know why their wireless setup broke
 - Clean Up Dark Mode and Theming Option confusions
+- Fix: Projection dies when a Bluetooth keyboard connects or disconnects
 
 ### v.3.2.6
 - Fix settings UI crash and dpi input on older Android devices
